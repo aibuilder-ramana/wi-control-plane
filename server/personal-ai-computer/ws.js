@@ -16,11 +16,17 @@ class MinimalWebSocketConnection {
     this.buffer = Buffer.alloc(0)
     this.meta = {}
     this.authToken = ''
+    this.lastPongAt = Date.now()
 
     socket.on('data', chunk => this.handleData(chunk))
     socket.on('close', () => this.handleClose())
     socket.on('end', () => this.handleClose())
     socket.on('error', () => this.handleClose())
+  }
+
+  sendPing() {
+    if (this.closed) return
+    try { this.socket.write(buildFrame(0x9, Buffer.alloc(0))) } catch (_) {}
   }
 
   sendJson(payload) {
@@ -61,11 +67,16 @@ class MinimalWebSocketConnection {
         this.socket.write(buildFrame(0xA, frame.payload))
         continue
       }
+      if (frame.opcode === 0xA) {
+        this.lastPongAt = Date.now()
+        continue
+      }
       if (frame.opcode !== 0x1) continue
       if (frame.fin === false) {
         this.close(1003, 'fragmented_messages_not_supported')
         return
       }
+      this.lastPongAt = Date.now()
       this.onMessage(this, frame.payload.toString('utf8'))
     }
   }
@@ -136,6 +147,12 @@ function rejectUpgrade(socket, statusCode, message) {
   socket.destroy()
 }
 
+const AUTH_TIMEOUT_MS = 5_000
+
+// Auth tokens are never accepted in the WS query string (proxies and access
+// logs commonly record full upgrade request URLs). The client must send an
+// `{type:'AUTH', token}` text frame as its first message; anything else, or
+// no message within AUTH_TIMEOUT_MS, closes the connection.
 function handlePersonalAiComputerUpgrade(req, socket, head, service) {
   const url = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`)
   if (!['/v1/pairing/ws', '/v1/ws/desktop', '/v1/ws/mobile'].includes(url.pathname)) return false
@@ -157,27 +174,60 @@ function handlePersonalAiComputerUpgrade(req, socket, head, service) {
     '\r\n'
   )
 
-  const connection = new MinimalWebSocketConnection(
-    socket,
-    (conn, message) => service.handleSocketMessage(conn, message),
-    conn => service.handleSocketClose(conn),
-  )
-
   const role = url.pathname === '/v1/ws/desktop'
     ? 'desktop'
     : url.pathname === '/v1/ws/mobile'
       ? 'mobile'
       : String(url.searchParams.get('role') || '')
-  const token = String(url.searchParams.get('token') || '')
+  const pendingIds = {
+    pairingSessionId: url.searchParams.get('pairingSessionId') || url.searchParams.get('session') || '',
+    pairId: url.searchParams.get('pairId') || '',
+  }
+
+  let authenticated = false
+  const connection = new MinimalWebSocketConnection(
+    socket,
+    (conn, message) => {
+      if (!authenticated) {
+        authenticated = true
+        clearTimeout(authTimer)
+        authenticateConnection(conn, message, role, pendingIds, service)
+        return
+      }
+      service.handleSocketMessage(conn, message)
+    },
+    conn => service.handleSocketClose(conn),
+  )
+
+  const authTimer = setTimeout(() => {
+    if (authenticated) return
+    authenticated = true
+    connection.sendJson({ type: 'ERROR', code: 'AUTH_TIMEOUT', message: 'Authentication timed out.' })
+    connection.close(1008, 'auth_timeout')
+  }, AUTH_TIMEOUT_MS)
+  if (typeof authTimer.unref === 'function') authTimer.unref()
+
+  return true
+}
+
+function authenticateConnection(connection, rawMessage, role, pendingIds, service) {
+  let message = null
+  try { message = JSON.parse(rawMessage) } catch (_) { message = null }
+  const token = message && message.type === 'AUTH' ? String(message.token || '') : ''
+  if (!token) {
+    connection.sendJson({ type: 'ERROR', code: 'AUTH_REQUIRED', message: 'First message must be an AUTH frame with a token.' })
+    connection.close(1008, 'auth_required')
+    return
+  }
   connection.authToken = token
   const result = role === 'desktop'
     ? service.registerDesktopConnection({
-      pairingSessionId: url.searchParams.get('pairingSessionId') || url.searchParams.get('session'),
+      pairingSessionId: pendingIds.pairingSessionId,
       token,
       connection,
     })
     : service.registerMobileConnection({
-      pairId: url.searchParams.get('pairId'),
+      pairId: pendingIds.pairId,
       token,
       connection,
     })
@@ -186,7 +236,6 @@ function handlePersonalAiComputerUpgrade(req, socket, head, service) {
     connection.sendJson({ type: 'ERROR', code: String(result.error || 'UPGRADE_REJECTED').toUpperCase(), message: String(result.error || 'Upgrade rejected.') })
     connection.close(1008, result.error)
   }
-  return true
 }
 
 module.exports = {

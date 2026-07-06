@@ -2,24 +2,33 @@ const test = require('node:test')
 const assert = require('node:assert/strict')
 const { PersonalAiComputerService } = require('./service')
 
-function fakeSocket(label = 'socket') {
-  return {
+function fakeSocket(label = 'socket', service = null) {
+  const socket = {
     label,
     closed: false,
     sent: [],
     meta: {},
     authToken: '',
+    lastPongAt: service ? service.now() : Date.now(),
+    pings: 0,
     sendJson(payload) { this.sent.push(payload) },
-    close() { this.closed = true },
+    sendPing() { this.pings += 1 },
+    close() {
+      if (this.closed) return
+      this.closed = true
+      if (service) service.handleSocketClose(this)
+    },
   }
+  return socket
 }
 
-function createService() {
+function createService(options = {}) {
   let current = Date.parse('2026-07-04T12:00:00Z')
   let nonce = 1
   const service = new PersonalAiComputerService({
     now: () => current,
     randomBytes: size => Buffer.alloc(size, nonce++),
+    ...options,
   })
   return {
     service,
@@ -33,8 +42,8 @@ function qrToken(session) {
 
 function pairDesktopAndMobile(service) {
   const session = service.createPairingSession()
-  const desktop = fakeSocket('desktop')
-  const mobile = fakeSocket('mobile')
+  const desktop = fakeSocket('desktop', service)
+  const mobile = fakeSocket('mobile', service)
   const desktopConnect = service.registerDesktopConnection({
     pairingSessionId: session.pairingSessionId,
     token: session.desktopSessionToken,
@@ -197,4 +206,55 @@ test('messages cannot be sent across unrelated pairs', () => {
   }))
   assert.equal(first.mobile.sent.some(event => event.type === 'ERROR' && event.code === 'PAIR_MISMATCH'), true)
   assert.equal(second.desktop.sent.some(event => event.type === 'TEST_MESSAGE' && event.payload?.text === 'cross-pair'), false)
+})
+
+test('heartbeat tick pings live connections', () => {
+  const { service } = createService()
+  const { desktop, mobile } = pairDesktopAndMobile(service)
+  service.runHeartbeatTick()
+  assert.equal(desktop.pings, 1)
+  assert.equal(mobile.pings, 1)
+  assert.equal(desktop.closed, false)
+  assert.equal(mobile.closed, false)
+})
+
+test('heartbeat tick closes connections that stopped responding', () => {
+  const { service, advance } = createService({ staleConnectionMs: 45_000 })
+  const { desktop, mobile } = pairDesktopAndMobile(service)
+  advance(46_000)
+  mobile.lastPongAt = service.now() // mobile stayed alive, desktop went dark
+  service.runHeartbeatTick()
+  assert.equal(desktop.closed, true)
+  assert.equal(mobile.closed, false)
+  assert.equal(mobile.pings, 1)
+})
+
+test('heartbeat tick drops abandoned pairs after both sides go offline', () => {
+  const { service, advance } = createService({ pairAbandonedMs: 30 * 60_000 })
+  const { claimed, desktop, mobile } = pairDesktopAndMobile(service)
+  desktop.close()
+  mobile.close()
+  advance(31 * 60_000)
+  service.runHeartbeatTick()
+  assert.equal(service.pairs.has(claimed.payload.pairId), false)
+})
+
+test('heartbeat tick keeps an abandoned-looking pair alive if activity is recent', () => {
+  const { service, advance } = createService({ pairAbandonedMs: 30 * 60_000 })
+  const { claimed, desktop, mobile } = pairDesktopAndMobile(service)
+  desktop.close()
+  mobile.close()
+  advance(10 * 60_000)
+  service.runHeartbeatTick()
+  assert.equal(service.pairs.has(claimed.payload.pairId), true)
+})
+
+test('heartbeat tick drops revoked pairs after the retention window', () => {
+  const { service, advance } = createService({ pairRetentionMs: 5 * 60_000 })
+  const { session, claimed } = pairDesktopAndMobile(service)
+  service.disconnectPair(claimed.payload.pairId, session.desktopSessionToken, 'user_disconnected')
+  assert.equal(service.pairs.has(claimed.payload.pairId), true)
+  advance(6 * 60_000)
+  service.runHeartbeatTick()
+  assert.equal(service.pairs.has(claimed.payload.pairId), false)
 })

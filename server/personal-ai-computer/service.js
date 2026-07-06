@@ -16,8 +16,84 @@ class PersonalAiComputerService {
     this.now = options.now || (() => Date.now())
     this.randomBytes = options.randomBytes || crypto.randomBytes
     this.pairingTtlMs = options.pairingTtlMs || 5 * 60_000
+    // How often the heartbeat tick pings live sockets and sweeps stale state.
+    this.heartbeatIntervalMs = options.heartbeatIntervalMs || 20_000
+    // A connection that hasn't produced a pong (or any frame) in this long is
+    // treated as dead — covers network drops that never send a clean TCP FIN.
+    this.staleConnectionMs = options.staleConnectionMs || 45_000
+    // Revoked pairs are kept briefly so a final status check still resolves,
+    // then dropped so `pairs` doesn't grow without bound.
+    this.pairRetentionMs = options.pairRetentionMs || 5 * 60_000
+    // A pair with no open socket on either side for this long is treated as
+    // abandoned (app closed / tab closed without an explicit disconnect).
+    this.pairAbandonedMs = options.pairAbandonedMs || 30 * 60_000
     this.sessions = new Map()
     this.pairs = new Map()
+    this.heartbeatTimer = null
+  }
+
+  startHeartbeat() {
+    if (this.heartbeatTimer) return
+    this.heartbeatTimer = setInterval(() => this.runHeartbeatTick(), this.heartbeatIntervalMs)
+    if (typeof this.heartbeatTimer.unref === 'function') this.heartbeatTimer.unref()
+  }
+
+  stopHeartbeat() {
+    if (!this.heartbeatTimer) return
+    clearInterval(this.heartbeatTimer)
+    this.heartbeatTimer = null
+  }
+
+  runHeartbeatTick() {
+    const current = this.now()
+    const seen = new Set()
+    const checkConnection = connection => {
+      if (!connection || connection.closed || seen.has(connection)) return
+      seen.add(connection)
+      const lastPongAt = typeof connection.lastPongAt === 'number' ? connection.lastPongAt : current
+      if (current - lastPongAt > this.staleConnectionMs) {
+        connection.close(1001, 'stale_connection')
+        return
+      }
+      if (typeof connection.sendPing === 'function') connection.sendPing()
+    }
+    for (const session of this.sessions.values()) checkConnection(session.desktopSocket)
+    for (const pair of this.pairs.values()) {
+      checkConnection(pair.desktopSocket)
+      checkConnection(pair.mobileSocket)
+    }
+    this.cleanupExpiredSessions()
+    this.cleanupStalePairs()
+  }
+
+  cleanupStalePairs() {
+    const current = this.now()
+    for (const [pairId, pair] of this.pairs.entries()) {
+      if (pair.revokedAt) {
+        if (current - new Date(pair.revokedAt).getTime() > this.pairRetentionMs) {
+          this.pairs.delete(pairId)
+        }
+        continue
+      }
+      const bothOffline = (!pair.desktopSocket || pair.desktopSocket.closed) && (!pair.mobileSocket || pair.mobileSocket.closed)
+      if (!bothOffline) continue
+      const lastActivityMs = Math.max(
+        pair.lastSeenDesktopAt ? new Date(pair.lastSeenDesktopAt).getTime() : 0,
+        pair.lastSeenMobileAt ? new Date(pair.lastSeenMobileAt).getTime() : 0,
+        new Date(pair.createdAt).getTime(),
+      )
+      if (current - lastActivityMs > this.pairAbandonedMs) {
+        // Both sides are already offline (bothOffline, above) so there is no
+        // live socket left to notify — just drop the abandoned pair.
+        const session = this.sessions.get(pair.pairingSessionId)
+        if (session) {
+          session.revokedAt = nowIso(this.now)
+          session.desktopSocket = null
+          session.desktopOnline = false
+        }
+        this.pairs.delete(pairId)
+      }
+    }
   }
 
   createPairingSession() {

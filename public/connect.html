@@ -411,13 +411,16 @@
     }
 
     function openDesktopSocket() {
-      const query = new URLSearchParams({
-        session: state.pairingSessionId,
-        token: state.desktopSessionToken,
-      });
+      // The pairing/session id is just an identifier; the desktop session
+      // token is the actual credential and is sent as the first WS message
+      // instead of a query param, so it never lands in access/proxy logs.
+      const query = new URLSearchParams({ session: state.pairingSessionId });
       const socket = new WebSocket(`${wsUrl('/v1/ws/desktop')}?${query.toString()}`);
       state.desktopSocket = socket;
-      socket.addEventListener('open', () => renderStatus({ desktopOnline: true, mobileOnline: state.mobileOnline }));
+      socket.addEventListener('open', () => {
+        socket.send(JSON.stringify({ type: 'AUTH', token: state.desktopSessionToken }));
+        renderStatus({ desktopOnline: true, mobileOnline: state.mobileOnline });
+      });
       socket.addEventListener('message', handleSocketEvent);
       socket.addEventListener('close', () => renderStatus({ desktopOnline: false, mobileOnline: false }));
       socket.addEventListener('error', () => setError('Desktop socket failed.'));

@@ -11,6 +11,7 @@ const PUBLIC_DIR = path.join(__dirname, 'public')
 const pairingTtlMs = Number(process.env.WI_PAIRING_TTL_MS || 5 * 60_000)
 
 const personalAiComputerService = new PersonalAiComputerService({ pairingTtlMs })
+personalAiComputerService.startHeartbeat()
 
 const MIME_TYPES = {
   '.html': 'text/html; charset=utf-8',
@@ -68,7 +69,9 @@ function serveStatic(req, res, url) {
   const pathname = url.pathname === '/' ? '/connect.html' : url.pathname
   const filePath = path.join(PUBLIC_DIR, pathname.replace(/^\/+/, ''))
   const normalized = path.normalize(filePath)
-  if (!normalized.startsWith(PUBLIC_DIR)) {
+  // Prefix must include the separator, otherwise a sibling directory like
+  // `${PUBLIC_DIR}-evil` would incorrectly pass a bare startsWith(PUBLIC_DIR).
+  if (normalized !== PUBLIC_DIR && !normalized.startsWith(PUBLIC_DIR + path.sep)) {
     sendJson(req, res, 403, { ok: false, error: 'Forbidden' })
     return
   }
