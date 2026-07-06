@@ -1,0 +1,442 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Wi Control Plane Pairing</title>
+  <script src="https://cdn.jsdelivr.net/npm/qrcode/build/qrcode.min.js"></script>
+  <style>
+    :root {
+      --bg: #08111c;
+      --bg2: #10253b;
+      --panel: rgba(8, 17, 28, 0.82);
+      --line: rgba(173, 216, 255, 0.15);
+      --text: #f4fbff;
+      --muted: #9eb5c7;
+      --mint: #6df0c2;
+      --blue: #6fbaff;
+      --red: #ff7a7a;
+      --amber: #ffd27a;
+    }
+
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      font-family: "Avenir Next", "Segoe UI", sans-serif;
+      background:
+        radial-gradient(circle at top left, rgba(111, 186, 255, 0.24), transparent 28%),
+        radial-gradient(circle at bottom right, rgba(109, 240, 194, 0.18), transparent 24%),
+        linear-gradient(160deg, var(--bg) 0%, var(--bg2) 100%);
+      color: var(--text);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 24px;
+    }
+
+    .shell {
+      width: min(1040px, 100%);
+      display: grid;
+      grid-template-columns: 420px 1fr;
+      gap: 20px;
+    }
+
+    .card {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 28px;
+      padding: 24px;
+      backdrop-filter: blur(18px);
+      box-shadow: 0 24px 70px rgba(0, 0, 0, 0.35);
+    }
+
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 8px 12px;
+      border-radius: 999px;
+      background: rgba(255, 255, 255, 0.05);
+      color: var(--muted);
+      font-size: 13px;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+    }
+
+    .badge::before {
+      content: "";
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: var(--amber);
+      box-shadow: 0 0 12px currentColor;
+    }
+
+    .badge.connected::before { background: var(--mint); }
+    .badge.offline::before { background: var(--red); }
+
+    h1 {
+      margin: 18px 0 10px;
+      font-size: 38px;
+      line-height: 1.02;
+      letter-spacing: -0.03em;
+    }
+
+    p { color: var(--muted); line-height: 1.55; }
+
+    .qr-wrap {
+      margin-top: 20px;
+      background: white;
+      border-radius: 24px;
+      padding: 20px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 300px;
+    }
+
+    .hint {
+      margin-top: 12px;
+      font-size: 13px;
+      color: var(--muted);
+      overflow-wrap: anywhere;
+    }
+
+    .stack {
+      display: flex;
+      flex-direction: column;
+      gap: 16px;
+    }
+
+    .panel-title {
+      margin: 0 0 8px;
+      font-size: 13px;
+      text-transform: uppercase;
+      letter-spacing: 0.1em;
+      color: var(--muted);
+    }
+
+    .status-row {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 12px;
+    }
+
+    .status-box {
+      border: 1px solid var(--line);
+      border-radius: 20px;
+      padding: 16px;
+      background: rgba(255, 255, 255, 0.04);
+    }
+
+    .status-box strong {
+      display: block;
+      margin-bottom: 6px;
+      font-size: 15px;
+    }
+
+    .messages {
+      height: 280px;
+      overflow: auto;
+      border: 1px solid var(--line);
+      border-radius: 20px;
+      padding: 12px;
+      background: rgba(2, 8, 14, 0.55);
+    }
+
+    .message {
+      padding: 12px;
+      border-radius: 16px;
+      margin-bottom: 10px;
+      border: 1px solid rgba(255, 255, 255, 0.08);
+      background: rgba(255, 255, 255, 0.04);
+    }
+
+    .message strong {
+      display: block;
+      margin-bottom: 5px;
+      font-size: 12px;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      color: var(--blue);
+    }
+
+    textarea, button {
+      font: inherit;
+    }
+
+    textarea {
+      width: 100%;
+      min-height: 100px;
+      resize: vertical;
+      border-radius: 18px;
+      border: 1px solid var(--line);
+      background: rgba(255, 255, 255, 0.04);
+      color: var(--text);
+      padding: 14px;
+    }
+
+    .actions {
+      display: flex;
+      gap: 12px;
+      flex-wrap: wrap;
+    }
+
+    button {
+      border: 0;
+      border-radius: 999px;
+      padding: 12px 18px;
+      cursor: pointer;
+      font-weight: 700;
+    }
+
+    .primary {
+      background: linear-gradient(135deg, var(--mint), #9ff7d1);
+      color: #042315;
+    }
+
+    .secondary {
+      background: rgba(255, 255, 255, 0.08);
+      color: var(--text);
+      border: 1px solid var(--line);
+    }
+
+    .error {
+      color: var(--red);
+      min-height: 22px;
+    }
+
+    @media (max-width: 920px) {
+      .shell { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+  <div class="shell">
+    <section class="card">
+      <div id="desktopBadge" class="badge">Waiting for phone</div>
+      <h1>Connect to your Personal AI Computer</h1>
+      <p>Keep this page open, then scan the QR code from Wi on your phone.</p>
+      <div class="qr-wrap"><canvas id="qrCanvas" width="280" height="280"></canvas></div>
+      <div class="hint" id="qrText"></div>
+      <div class="hint" id="expiryText"></div>
+    </section>
+
+    <section class="stack">
+      <div class="card">
+        <div class="panel-title">Pair Status</div>
+        <div class="status-row">
+          <div class="status-box">
+            <strong>Desktop Browser</strong>
+            <span id="desktopStatus">Connecting…</span>
+          </div>
+          <div class="status-box">
+            <strong>Wi Mobile</strong>
+            <span id="mobileStatus">Waiting for phone…</span>
+          </div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="panel-title">Send Test Message</div>
+        <textarea id="messageInput">Hello from desktop</textarea>
+        <div class="actions" style="margin-top: 12px;">
+          <button id="sendButton" class="primary" disabled>Send to mobile</button>
+          <button id="disconnectButton" class="secondary" disabled>Disconnect pair</button>
+          <button id="resetButton" class="secondary">New QR session</button>
+        </div>
+        <div id="errorText" class="error"></div>
+      </div>
+
+      <div class="card">
+        <div class="panel-title">Messages</div>
+        <div id="messages" class="messages"></div>
+      </div>
+    </section>
+  </div>
+
+  <script>
+    const state = {
+      pairingSessionId: '',
+      desktopSessionToken: '',
+      pairId: '',
+      desktopSocket: null,
+      expiresAt: '',
+      messages: [],
+      desktopOnline: false,
+      mobileOnline: false,
+      mobileDeviceName: 'Wi Mobile',
+    };
+
+    const els = {
+      badge: document.getElementById('desktopBadge'),
+      desktopStatus: document.getElementById('desktopStatus'),
+      mobileStatus: document.getElementById('mobileStatus'),
+      qrCanvas: document.getElementById('qrCanvas'),
+      qrText: document.getElementById('qrText'),
+      expiryText: document.getElementById('expiryText'),
+      messageInput: document.getElementById('messageInput'),
+      sendButton: document.getElementById('sendButton'),
+      disconnectButton: document.getElementById('disconnectButton'),
+      resetButton: document.getElementById('resetButton'),
+      errorText: document.getElementById('errorText'),
+      messages: document.getElementById('messages'),
+    };
+
+    function wsUrl(path) {
+      const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+      return `${protocol}//${window.location.host}${path}`;
+    }
+
+    function setError(message) {
+      els.errorText.textContent = message || '';
+    }
+
+    function renderMessages() {
+      if (!state.messages.length) {
+        els.messages.innerHTML = '<p style="margin:0;color:var(--muted);">No messages yet.</p>';
+        return;
+      }
+      els.messages.innerHTML = state.messages.map((message) => `
+        <div class="message">
+          <strong>${message.from}</strong>
+          <div>${escapeHtml(message.payload?.text || message.text || '')}</div>
+        </div>
+      `).join('');
+      els.messages.scrollTop = els.messages.scrollHeight;
+    }
+
+    function renderStatus(snapshot) {
+      if (snapshot) {
+        state.desktopOnline = Boolean(snapshot.desktopOnline);
+        state.mobileOnline = Boolean(snapshot.mobileOnline);
+        if (snapshot.mobileDeviceName) state.mobileDeviceName = snapshot.mobileDeviceName;
+      } else {
+        state.desktopOnline = Boolean(state.desktopSocket && state.desktopSocket.readyState === WebSocket.OPEN);
+      }
+      const desktopOnline = state.desktopOnline;
+      const mobileOnline = state.mobileOnline;
+      els.desktopStatus.textContent = desktopOnline ? 'Online' : 'Offline';
+      els.mobileStatus.textContent = mobileOnline ? `${state.mobileDeviceName} connected` : 'Waiting for phone…';
+      els.sendButton.disabled = !desktopOnline || !mobileOnline;
+      els.disconnectButton.disabled = !state.pairId;
+      if (desktopOnline && mobileOnline) {
+        els.badge.className = 'badge connected';
+        els.badge.textContent = 'Connected';
+      } else if (state.pairId) {
+        els.badge.className = 'badge offline';
+        els.badge.textContent = 'Mobile offline';
+      } else {
+        els.badge.className = 'badge';
+        els.badge.textContent = 'Waiting for phone';
+      }
+    }
+
+    function escapeHtml(value) {
+      return String(value || '')
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;');
+    }
+
+    function handleSocketEvent(event) {
+      const message = JSON.parse(event.data);
+      if (message.type === 'DESKTOP_READY') {
+        renderStatus({ desktopOnline: true, mobileOnline: false });
+        return;
+      }
+      if (message.type === 'PAIR_CONFIRMED') {
+        state.pairId = message.pairId;
+        if (message.mobileDeviceName) state.mobileDeviceName = message.mobileDeviceName;
+        setError('');
+        renderStatus({ desktopOnline: true, mobileOnline: state.mobileOnline });
+        return;
+      }
+      if (message.type === 'PRESENCE') {
+        state.pairId = message.pairId || state.pairId;
+        state.messages = Array.isArray(message.messages) ? message.messages : state.messages;
+        renderMessages();
+        renderStatus(message);
+        return;
+      }
+      if (message.type === 'TEST_MESSAGE') {
+        state.messages = [...state.messages.filter((entry) => entry.id !== message.id), message];
+        renderMessages();
+        return;
+      }
+      if (message.type === 'PAIR_DISCONNECTED') {
+        setError(message.reason || 'Pair disconnected');
+        renderStatus({ desktopOnline: false, mobileOnline: false });
+        return;
+      }
+      if (message.type === 'ERROR') {
+        setError(message.message || message.code || 'Connection error');
+      }
+    }
+
+    async function createSession() {
+      setError('');
+      renderStatus({ desktopOnline: false, mobileOnline: false });
+      state.messages = [];
+      renderMessages();
+      if (state.desktopSocket) state.desktopSocket.close();
+      const response = await fetch('/v1/pairing/session', { method: 'POST' });
+      if (!response.ok) throw new Error(`Failed to create session (${response.status})`);
+      const payload = await response.json();
+      state.pairingSessionId = payload.pairingSessionId;
+      state.desktopSessionToken = payload.desktopSessionToken;
+      state.expiresAt = payload.expiresAt;
+      state.pairId = '';
+      await QRCode.toCanvas(els.qrCanvas, payload.qrPayload, {
+        width: 280,
+        margin: 1,
+        color: { dark: '#08111c', light: '#ffffff' },
+      });
+      els.qrText.textContent = payload.qrPayload;
+      els.expiryText.textContent = `Expires at ${new Date(payload.expiresAt).toLocaleTimeString()}`;
+      openDesktopSocket();
+    }
+
+    function openDesktopSocket() {
+      const query = new URLSearchParams({
+        session: state.pairingSessionId,
+        token: state.desktopSessionToken,
+      });
+      const socket = new WebSocket(`${wsUrl('/v1/ws/desktop')}?${query.toString()}`);
+      state.desktopSocket = socket;
+      socket.addEventListener('open', () => renderStatus({ desktopOnline: true, mobileOnline: state.mobileOnline }));
+      socket.addEventListener('message', handleSocketEvent);
+      socket.addEventListener('close', () => renderStatus({ desktopOnline: false, mobileOnline: false }));
+      socket.addEventListener('error', () => setError('Desktop socket failed.'));
+    }
+
+    async function disconnectPair() {
+      if (!state.pairId) return;
+      const response = await fetch(`/v1/pairs/${encodeURIComponent(state.pairId)}/disconnect`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${state.desktopSessionToken}`,
+        },
+        body: JSON.stringify({ reason: 'desktop_disconnect' }),
+      });
+      if (!response.ok) throw new Error(`Disconnect failed (${response.status})`);
+      renderStatus({ desktopOnline: false, mobileOnline: false });
+    }
+
+    function sendMessage() {
+      const text = els.messageInput.value.trim();
+      if (!text || !state.desktopSocket || state.desktopSocket.readyState !== WebSocket.OPEN) return;
+      state.desktopSocket.send(JSON.stringify({ type: 'TEST_MESSAGE', text }));
+    }
+
+    els.sendButton.addEventListener('click', sendMessage);
+    els.disconnectButton.addEventListener('click', () => disconnectPair().catch((error) => setError(error.message)));
+    els.resetButton.addEventListener('click', () => createSession().catch((error) => setError(error.message)));
+
+    renderMessages();
+    createSession().catch((error) => setError(error.message));
+  </script>
+</body>
+</html>
