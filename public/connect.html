@@ -162,6 +162,12 @@
       color: var(--blue);
     }
 
+    .message div {
+      color: var(--text);
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+
     textarea, button {
       font: inherit;
     }
@@ -174,7 +180,13 @@
       border: 1px solid var(--line);
       background: rgba(255, 255, 255, 0.04);
       color: var(--text);
+      -webkit-text-fill-color: var(--text);
+      caret-color: var(--text);
       padding: 14px;
+    }
+
+    textarea::placeholder {
+      color: var(--muted);
     }
 
     .actions {
@@ -428,7 +440,24 @@
     function sendMessage() {
       const text = els.messageInput.value.trim();
       if (!text || !state.desktopSocket || state.desktopSocket.readyState !== WebSocket.OPEN) return;
-      state.desktopSocket.send(JSON.stringify({ type: 'TEST_MESSAGE', text }));
+      const optimisticMessage = {
+        type: 'TEST_MESSAGE',
+        pairId: state.pairId,
+        from: 'desktop',
+        id: `local_${Date.now()}`,
+        payload: {
+          text,
+          sentAt: new Date().toISOString(),
+        },
+      };
+      state.messages = [...state.messages, optimisticMessage];
+      renderMessages();
+      state.desktopSocket.send(JSON.stringify({
+        type: 'TEST_MESSAGE',
+        pairId: state.pairId,
+        payload: { text },
+      }));
+      els.messageInput.value = '';
     }
 
     els.sendButton.addEventListener('click', sendMessage);
