@@ -229,22 +229,12 @@ test('heartbeat tick closes connections that stopped responding', () => {
   assert.equal(mobile.pings, 1)
 })
 
-test('heartbeat tick drops abandoned pairs after both sides go offline', () => {
-  const { service, advance } = createService({ pairAbandonedMs: 30 * 60_000 })
+test('a pair with both sides offline survives indefinitely (no abandonment sweep)', () => {
+  const { service, advance } = createService()
   const { claimed, desktop, mobile } = pairDesktopAndMobile(service)
   desktop.close()
   mobile.close()
-  advance(31 * 60_000)
-  service.runHeartbeatTick()
-  assert.equal(service.pairs.has(claimed.payload.pairId), false)
-})
-
-test('heartbeat tick keeps an abandoned-looking pair alive if activity is recent', () => {
-  const { service, advance } = createService({ pairAbandonedMs: 30 * 60_000 })
-  const { claimed, desktop, mobile } = pairDesktopAndMobile(service)
-  desktop.close()
-  mobile.close()
-  advance(10 * 60_000)
+  advance(10 * 24 * 60 * 60_000) // 10 days
   service.runHeartbeatTick()
   assert.equal(service.pairs.has(claimed.payload.pairId), true)
 })
@@ -257,4 +247,128 @@ test('heartbeat tick drops revoked pairs after the retention window', () => {
   advance(6 * 60_000)
   service.runHeartbeatTick()
   assert.equal(service.pairs.has(claimed.payload.pairId), false)
+})
+
+test('registerDesktopConnectionByPair reconnects a desktop bridge using pairId + desktopToken', () => {
+  const { service } = createService()
+  const { session, claimed, desktop: originalDesktop } = pairDesktopAndMobile(service)
+  const desktopToken = originalDesktop.sent.find(e => e.type === 'PAIR_CONFIRMED' && e.desktopToken).desktopToken
+  assert.match(desktopToken, /^dtk_/)
+
+  const bridge = fakeSocket('bridge', service)
+  const result = service.registerDesktopConnectionByPair({
+    pairId: claimed.payload.pairId,
+    token: desktopToken,
+    connection: bridge,
+  })
+  assert.equal(result.ok, true)
+  assert.equal(bridge.sent.some(e => e.type === 'PAIR_CONFIRMED'), true)
+  assert.equal(service.pairs.get(claimed.payload.pairId).desktopSocket, bridge)
+})
+
+test('registerDesktopConnectionByPair rejects a wrong token', () => {
+  const { service } = createService()
+  const { claimed } = pairDesktopAndMobile(service)
+  const bridge = fakeSocket('bridge', service)
+  const result = service.registerDesktopConnectionByPair({
+    pairId: claimed.payload.pairId,
+    token: 'wrong-token',
+    connection: bridge,
+  })
+  assert.equal(result.ok, false)
+  assert.equal(result.status, 401)
+  assert.equal(result.error, 'invalid_desktop_token')
+})
+
+test('registerDesktopConnectionByPair rejects a revoked pair', () => {
+  const { service } = createService()
+  const { session, claimed, desktop } = pairDesktopAndMobile(service)
+  const desktopToken = desktop.sent.find(e => e.type === 'PAIR_CONFIRMED' && e.desktopToken).desktopToken
+  service.disconnectPair(claimed.payload.pairId, session.desktopSessionToken, 'user_disconnected')
+  const bridge = fakeSocket('bridge', service)
+  const result = service.registerDesktopConnectionByPair({
+    pairId: claimed.payload.pairId,
+    token: desktopToken,
+    connection: bridge,
+  })
+  assert.equal(result.ok, false)
+  assert.equal(result.status, 410)
+  assert.equal(result.error, 'pair_revoked')
+})
+
+function pairWithDurableDesktop(service) {
+  const { session, claimed, mobile, desktop: originalDesktop } = pairDesktopAndMobile(service)
+  const desktopToken = originalDesktop.sent.find(e => e.type === 'PAIR_CONFIRMED' && e.desktopToken).desktopToken
+  const bridge = fakeSocket('bridge', service)
+  service.registerDesktopConnectionByPair({ pairId: claimed.payload.pairId, token: desktopToken, connection: bridge })
+  mobile.meta = { role: 'mobile', pairId: claimed.payload.pairId, pairingSessionId: session.pairingSessionId }
+  return { session, claimed, mobile, bridge }
+}
+
+test('AI_TEST_REQUEST forwards from mobile to the connected desktop bridge', () => {
+  const { service } = createService()
+  const { claimed, mobile, bridge } = pairWithDurableDesktop(service)
+  service.handleSocketMessage(mobile, JSON.stringify({
+    type: 'AI_TEST_REQUEST',
+    pairId: claimed.payload.pairId,
+    requestId: 'req-1',
+    payload: { prompt: 'Say hello' },
+  }))
+  const forwarded = bridge.sent.find(e => e.type === 'AI_TEST_REQUEST')
+  assert.ok(forwarded)
+  assert.equal(forwarded.requestId, 'req-1')
+  assert.equal(forwarded.payload.prompt, 'Say hello')
+})
+
+test('AI_TEST_REQUEST gets DESKTOP_OFFLINE when no desktop bridge is connected', () => {
+  const { service } = createService()
+  const { claimed, mobile, desktop } = pairDesktopAndMobile(service)
+  desktop.close()
+  mobile.meta = { role: 'mobile', pairId: claimed.payload.pairId, pairingSessionId: 'ignored' }
+  service.handleSocketMessage(mobile, JSON.stringify({
+    type: 'AI_TEST_REQUEST',
+    pairId: claimed.payload.pairId,
+    requestId: 'req-2',
+    payload: { prompt: 'Say hello' },
+  }))
+  const error = mobile.sent.find(e => e.type === 'AI_TEST_ERROR')
+  assert.ok(error)
+  assert.equal(error.requestId, 'req-2')
+  assert.equal(error.payload.code, 'DESKTOP_OFFLINE')
+})
+
+test('AI_TEST_RESPONSE forwards from desktop bridge to mobile', () => {
+  const { service } = createService()
+  const { claimed, mobile, bridge } = pairWithDurableDesktop(service)
+  service.handleSocketMessage(bridge, JSON.stringify({
+    type: 'AI_TEST_RESPONSE',
+    pairId: claimed.payload.pairId,
+    requestId: 'req-3',
+    payload: { model: 'qwen3:32b', text: 'Hello!' },
+  }))
+  const forwarded = mobile.sent.find(e => e.type === 'AI_TEST_RESPONSE')
+  assert.ok(forwarded)
+  assert.equal(forwarded.requestId, 'req-3')
+  assert.equal(forwarded.payload.text, 'Hello!')
+})
+
+test('AI_TEST_ERROR from desktop bridge forwards to mobile', () => {
+  const { service } = createService()
+  const { claimed, mobile, bridge } = pairWithDurableDesktop(service)
+  service.handleSocketMessage(bridge, JSON.stringify({
+    type: 'AI_TEST_ERROR',
+    pairId: claimed.payload.pairId,
+    requestId: 'req-4',
+    payload: { code: 'OLLAMA_UNAVAILABLE', message: 'Could not reach Ollama.' },
+  }))
+  const forwarded = mobile.sent.find(e => e.type === 'AI_TEST_ERROR')
+  assert.ok(forwarded)
+  assert.equal(forwarded.payload.code, 'OLLAMA_UNAVAILABLE')
+})
+
+test('PING from a connection gets a direct PONG reply', () => {
+  const { service } = createService()
+  const { bridge } = pairWithDurableDesktop(service)
+  service.handleSocketMessage(bridge, JSON.stringify({ type: 'PING' }))
+  assert.equal(bridge.sent.some(e => e.type === 'PONG'), true)
 })

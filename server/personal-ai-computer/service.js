@@ -1,5 +1,10 @@
 const crypto = require('crypto')
 
+// Matches wi-desktop-bridge's own AI_TEST_REQUEST_MAX_BYTES so an oversized
+// prompt is rejected here (cheaply, before waking the desktop) rather than
+// only by the bridge after a round trip.
+const AI_TEST_REQUEST_MAX_BYTES = 64 * 1024
+
 function nowIso(nowFn) {
   return new Date(nowFn()).toISOString()
 }
@@ -24,9 +29,6 @@ class PersonalAiComputerService {
     // Revoked pairs are kept briefly so a final status check still resolves,
     // then dropped so `pairs` doesn't grow without bound.
     this.pairRetentionMs = options.pairRetentionMs || 5 * 60_000
-    // A pair with no open socket on either side for this long is treated as
-    // abandoned (app closed / tab closed without an explicit disconnect).
-    this.pairAbandonedMs = options.pairAbandonedMs || 30 * 60_000
     this.sessions = new Map()
     this.pairs = new Map()
     this.heartbeatTimer = null
@@ -64,33 +66,17 @@ class PersonalAiComputerService {
     }
     this.cleanupExpiredSessions()
     this.cleanupStalePairs()
+    // No persistence layer backs `sessions`/`pairs` (both reset on the next
+    // process restart anyway) and pairs now live until explicitly
+    // disconnected — log size periodically so unbounded growth is at least
+    // observable rather than invisible.
+    console.log(`wi-control-plane heartbeat: sessions=${this.sessions.size} pairs=${this.pairs.size}`)
   }
 
   cleanupStalePairs() {
     const current = this.now()
     for (const [pairId, pair] of this.pairs.entries()) {
-      if (pair.revokedAt) {
-        if (current - new Date(pair.revokedAt).getTime() > this.pairRetentionMs) {
-          this.pairs.delete(pairId)
-        }
-        continue
-      }
-      const bothOffline = (!pair.desktopSocket || pair.desktopSocket.closed) && (!pair.mobileSocket || pair.mobileSocket.closed)
-      if (!bothOffline) continue
-      const lastActivityMs = Math.max(
-        pair.lastSeenDesktopAt ? new Date(pair.lastSeenDesktopAt).getTime() : 0,
-        pair.lastSeenMobileAt ? new Date(pair.lastSeenMobileAt).getTime() : 0,
-        new Date(pair.createdAt).getTime(),
-      )
-      if (current - lastActivityMs > this.pairAbandonedMs) {
-        // Both sides are already offline (bothOffline, above) so there is no
-        // live socket left to notify — just drop the abandoned pair.
-        const session = this.sessions.get(pair.pairingSessionId)
-        if (session) {
-          session.revokedAt = nowIso(this.now)
-          session.desktopSocket = null
-          session.desktopOnline = false
-        }
+      if (pair.revokedAt && current - new Date(pair.revokedAt).getTime() > this.pairRetentionMs) {
         this.pairs.delete(pairId)
       }
     }
@@ -143,6 +129,11 @@ class PersonalAiComputerService {
 
     const pairId = this.id('pair')
     const mobileWsToken = this.token('mws')
+    // Durable, pair-scoped desktop credential — unlike desktopSessionToken
+    // (tied to this short-lived pairing session), this survives indefinitely
+    // so a headless desktop client (e.g. a background bridge process) can
+    // reconnect after its own restarts without redoing the QR pairing dance.
+    const desktopToken = this.token('dtk')
     const pair = {
       pairId,
       pairingSessionId,
@@ -158,6 +149,8 @@ class PersonalAiComputerService {
       desktopSocket: session.desktopSocket || null,
       mobileSocket: null,
       mobileWsTokenHash: this.hashToken(mobileWsToken),
+      desktopTokenHash: this.hashToken(desktopToken),
+      desktopBridgeInfo: null,
       messageLog: [],
     }
     session.claimedAt = nowIso(this.now)
@@ -166,11 +159,15 @@ class PersonalAiComputerService {
 
     if (pair.desktopSocket) {
       pair.desktopSocket.meta = { role: 'desktop', pairId, pairingSessionId }
+      // desktopToken is shown here in plaintext exactly once — like
+      // mobileWsToken, only the hash is retained server-side afterward, so
+      // it can never be re-displayed on a later reconnect.
       this.sendEvent(pair.desktopSocket, 'PAIR_CONFIRMED', {
         pairId,
         status: 'paired',
         desktopDeviceName: pair.desktopDeviceName,
         mobileDeviceName: pair.mobileDeviceName,
+        desktopToken,
       })
       this.sendPresence(pair)
     }
@@ -230,6 +227,41 @@ class PersonalAiComputerService {
       }
     }
 
+    return { ok: true, status: 101 }
+  }
+
+  // Durable counterpart to registerDesktopConnection: authenticates directly
+  // against an established pair's desktopTokenHash instead of a pairing
+  // session, so a headless desktop client can reconnect after restarting
+  // using only the pairId + desktopToken it was given once at claim time.
+  // Note: a connect.html tab (session-based) and a durable-token client can
+  // both claim `pair.desktopSocket` independently — whichever registers last
+  // wins the slot, the other is left orphaned. Known MVP limitation.
+  registerDesktopConnectionByPair(input) {
+    const pairId = String(input.pairId || '')
+    const token = String(input.token || '')
+    const connection = input.connection
+    const pair = this.pairs.get(pairId)
+    if (!pair) return { ok: false, status: 404, error: 'pair_not_found' }
+    if (pair.revokedAt) return { ok: false, status: 410, error: 'pair_revoked' }
+    if (!pair.desktopTokenHash || !safeEqual(pair.desktopTokenHash, this.hashToken(token))) {
+      return { ok: false, status: 401, error: 'invalid_desktop_token' }
+    }
+
+    if (pair.desktopSocket && pair.desktopSocket !== connection) {
+      pair.desktopSocket.close(1000, 'replaced')
+    }
+    pair.desktopSocket = connection
+    pair.desktopOnline = true
+    pair.lastSeenDesktopAt = nowIso(this.now)
+    connection.meta = { role: 'desktop', pairId, pairingSessionId: pair.pairingSessionId }
+    this.sendEvent(connection, 'PAIR_CONFIRMED', {
+      pairId: pair.pairId,
+      status: 'paired',
+      desktopDeviceName: pair.desktopDeviceName,
+      mobileDeviceName: pair.mobileDeviceName,
+    })
+    this.sendPresence(pair)
     return { ok: true, status: 101 }
   }
 
@@ -321,6 +353,25 @@ class PersonalAiComputerService {
       if (pairId) this.disconnectPair(pairId, this.tokenFromConnection(connection), 'peer_disconnected')
       return
     }
+    if (message.type === 'AI_TEST_REQUEST') {
+      this.forwardAiTestRequest(connection, message)
+      return
+    }
+    if (message.type === 'AI_TEST_RESPONSE' || message.type === 'AI_TEST_ERROR') {
+      this.forwardAiTestResult(connection, message)
+      return
+    }
+    if (message.type === 'PING') {
+      this.sendEvent(connection, 'PONG', {})
+      return
+    }
+    if (message.type === 'PONG') {
+      return
+    }
+    if (message.type === 'BRIDGE_READY' || message.type === 'BRIDGE_HEALTH') {
+      this.handleBridgeStatus(connection, message)
+      return
+    }
     this.sendError(connection, 'UNSUPPORTED_MESSAGE_TYPE', 'This message type is not supported in the MVP bridge.')
   }
 
@@ -390,6 +441,79 @@ class PersonalAiComputerService {
     this.sendPresence(pair)
   }
 
+  // Mobile → desktop. Stateless forward (no messageLog, no echo back to the
+  // sender) — unlike TEST_MESSAGE this isn't a chat, it's a single
+  // request/response exchange the desktop bridge answers directly.
+  forwardAiTestRequest(connection, message) {
+    const meta = connection.meta || {}
+    const requestId = String((message && message.requestId) || '').trim()
+    const claimedPairId = String((message && message.pairId) || '')
+    const prompt = String(message?.payload?.prompt || '').trim()
+
+    if (claimedPairId && meta.pairId && claimedPairId !== meta.pairId) {
+      this.sendError(connection, 'PAIR_MISMATCH', 'Messages can only be sent to the authenticated pair.')
+      return
+    }
+    const pair = this.pairs.get(meta.pairId)
+    if (!pair || pair.revokedAt) {
+      this.sendError(connection, 'PAIR_UNAVAILABLE', 'The requested pair is unavailable.')
+      return
+    }
+    if (!requestId) {
+      this.sendEvent(connection, 'AI_TEST_ERROR', { pairId: pair.pairId, payload: { code: 'INVALID_REQUEST_ID', message: 'Request is missing requestId.' } })
+      return
+    }
+    if (!prompt || Buffer.byteLength(prompt, 'utf8') > AI_TEST_REQUEST_MAX_BYTES) {
+      this.sendEvent(connection, 'AI_TEST_ERROR', { pairId: pair.pairId, requestId, payload: { code: 'INVALID_PROMPT', message: 'Prompt is missing or too large.' } })
+      return
+    }
+
+    pair.lastSeenMobileAt = nowIso(this.now)
+    if (!pair.desktopSocket || pair.desktopSocket.closed) {
+      this.sendEvent(connection, 'AI_TEST_ERROR', {
+        pairId: pair.pairId,
+        requestId,
+        payload: { code: 'DESKTOP_OFFLINE', message: 'Your Personal AI Computer is offline.' },
+      })
+      return
+    }
+    this.sendEvent(pair.desktopSocket, 'AI_TEST_REQUEST', {
+      pairId: pair.pairId,
+      requestId,
+      payload: { prompt },
+    })
+  }
+
+  // Desktop → mobile. pairId is re-keyed from the server-trusted connection
+  // meta, not the desktop bridge's own claimed message.pairId.
+  forwardAiTestResult(connection, message) {
+    const meta = connection.meta || {}
+    if (meta.role !== 'desktop') return
+    const pair = this.pairs.get(meta.pairId)
+    if (!pair || pair.revokedAt || !pair.mobileSocket || pair.mobileSocket.closed) return
+    const requestId = String((message && message.requestId) || '')
+    this.sendEvent(pair.mobileSocket, message.type, {
+      pairId: pair.pairId,
+      requestId,
+      payload: (message && message.payload) || {},
+    })
+  }
+
+  // Informational only — lets the mobile side eventually show which model
+  // the paired desktop bridge is running. Never rejects the connection.
+  handleBridgeStatus(connection, message) {
+    const meta = connection.meta || {}
+    if (meta.role !== 'desktop') return
+    const pair = this.pairs.get(meta.pairId)
+    if (!pair) return
+    const payload = (message && message.payload) || {}
+    pair.desktopBridgeInfo = {
+      client: String(payload.client || 'desktop-bridge'),
+      model: String(payload.model || ''),
+      updatedAt: nowIso(this.now),
+    }
+  }
+
   sendPresence(pair) {
     const payload = {
       type: 'PRESENCE',
@@ -422,9 +546,10 @@ class PersonalAiComputerService {
     if (!pair) return { ok: false, status: 404, error: 'pair_not_found' }
     const provided = String(authToken || '')
     const session = this.sessions.get(pair.pairingSessionId)
-    const desktopOkay = session && safeEqual(session.desktopSessionTokenHash, this.hashToken(provided))
+    const desktopSessionOkay = session && safeEqual(session.desktopSessionTokenHash, this.hashToken(provided))
+    const desktopTokenOkay = pair.desktopTokenHash && safeEqual(pair.desktopTokenHash, this.hashToken(provided))
     const mobileOkay = safeEqual(pair.mobileWsTokenHash, this.hashToken(provided))
-    if (!desktopOkay && !mobileOkay) return { ok: false, status: 401, error: 'unauthorized' }
+    if (!desktopSessionOkay && !desktopTokenOkay && !mobileOkay) return { ok: false, status: 401, error: 'unauthorized' }
     return { ok: true, pair }
   }
 

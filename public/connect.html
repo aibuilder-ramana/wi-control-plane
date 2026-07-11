@@ -219,6 +219,32 @@
       min-height: 22px;
     }
 
+    .mono-row {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      background: rgba(2, 8, 14, 0.55);
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      padding: 10px 12px;
+      margin-top: 8px;
+    }
+
+    .mono-row code {
+      flex: 1;
+      font-family: "SF Mono", Menlo, Consolas, monospace;
+      font-size: 12.5px;
+      overflow-wrap: anywhere;
+    }
+
+    .mono-row button {
+      flex-shrink: 0;
+      padding: 6px 12px;
+      font-size: 12px;
+    }
+
+    .hidden { display: none; }
+
     @media (max-width: 920px) {
       .shell { grid-template-columns: 1fr; }
     }
@@ -250,6 +276,19 @@
         </div>
       </div>
 
+      <div class="card hidden" id="bridgeSetupCard">
+        <div class="panel-title">Desktop Bridge Setup</div>
+        <p style="margin-top: 0;">Paste these into a headless desktop client's config (e.g. <code>wi-desktop-bridge</code>'s <code>.env</code>) to let it reconnect on its own after a restart — no re-scanning needed. Shown once; if you lose it, disconnect and re-pair.</p>
+        <div class="mono-row">
+          <code id="bridgePairId"></code>
+          <button class="secondary" id="copyPairIdButton" type="button">Copy</button>
+        </div>
+        <div class="mono-row">
+          <code id="bridgeDesktopToken"></code>
+          <button class="secondary" id="copyDesktopTokenButton" type="button">Copy</button>
+        </div>
+      </div>
+
       <div class="card">
         <div class="panel-title">Send Test Message</div>
         <textarea id="messageInput">Hello from desktop</textarea>
@@ -273,6 +312,7 @@
       pairingSessionId: '',
       desktopSessionToken: '',
       pairId: '',
+      desktopToken: '',
       desktopSocket: null,
       expiresAt: '',
       messages: [],
@@ -294,6 +334,11 @@
       resetButton: document.getElementById('resetButton'),
       errorText: document.getElementById('errorText'),
       messages: document.getElementById('messages'),
+      bridgeSetupCard: document.getElementById('bridgeSetupCard'),
+      bridgePairId: document.getElementById('bridgePairId'),
+      bridgeDesktopToken: document.getElementById('bridgeDesktopToken'),
+      copyPairIdButton: document.getElementById('copyPairIdButton'),
+      copyDesktopTokenButton: document.getElementById('copyDesktopTokenButton'),
     };
 
     function wsUrl(path) {
@@ -361,6 +406,15 @@
       if (message.type === 'PAIR_CONFIRMED') {
         state.pairId = message.pairId;
         if (message.mobileDeviceName) state.mobileDeviceName = message.mobileDeviceName;
+        // desktopToken is only ever sent once, right after the initial claim
+        // — a later reconnect's PAIR_CONFIRMED won't include it, so only
+        // (re)populate the panel when it's actually present.
+        if (message.desktopToken) {
+          state.desktopToken = message.desktopToken;
+          els.bridgePairId.textContent = state.pairId;
+          els.bridgeDesktopToken.textContent = state.desktopToken;
+          els.bridgeSetupCard.classList.remove('hidden');
+        }
         setError('');
         renderStatus({ desktopOnline: true, mobileOnline: state.mobileOnline });
         return;
@@ -400,6 +454,8 @@
       state.desktopSessionToken = payload.desktopSessionToken;
       state.expiresAt = payload.expiresAt;
       state.pairId = '';
+      state.desktopToken = '';
+      els.bridgeSetupCard.classList.add('hidden');
       await QRCode.toCanvas(els.qrCanvas, payload.qrPayload, {
         width: 280,
         margin: 1,
@@ -463,9 +519,20 @@
       els.messageInput.value = '';
     }
 
+    function copyToClipboard(text, button) {
+      if (!text) return;
+      const original = button.textContent;
+      navigator.clipboard.writeText(text).then(() => {
+        button.textContent = 'Copied!';
+        setTimeout(() => { button.textContent = original; }, 1500);
+      }).catch(() => setError('Could not copy to clipboard.'));
+    }
+
     els.sendButton.addEventListener('click', sendMessage);
     els.disconnectButton.addEventListener('click', () => disconnectPair().catch((error) => setError(error.message)));
     els.resetButton.addEventListener('click', () => createSession().catch((error) => setError(error.message)));
+    els.copyPairIdButton.addEventListener('click', () => copyToClipboard(state.pairId, els.copyPairIdButton));
+    els.copyDesktopTokenButton.addEventListener('click', () => copyToClipboard(state.desktopToken, els.copyDesktopTokenButton));
 
     renderMessages();
     createSession().catch((error) => setError(error.message));

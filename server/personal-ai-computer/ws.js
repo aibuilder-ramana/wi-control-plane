@@ -220,12 +220,24 @@ function authenticateConnection(connection, rawMessage, role, pendingIds, servic
     return
   }
   connection.authToken = token
+  // Desktop connections come in two shapes: connect.html's original
+  // QR-pairing session (pairingSessionId + desktopSessionToken) and a
+  // durable, pair-scoped credential (pairId + desktopToken) used by headless
+  // clients like wi-desktop-bridge to reconnect after their own restarts
+  // without redoing the pairing dance. Prefer the durable path when a pairId
+  // is present; fall back to the session path otherwise.
   const result = role === 'desktop'
-    ? service.registerDesktopConnection({
-      pairingSessionId: pendingIds.pairingSessionId,
-      token,
-      connection,
-    })
+    ? (pendingIds.pairId
+      ? service.registerDesktopConnectionByPair({
+        pairId: pendingIds.pairId,
+        token,
+        connection,
+      })
+      : service.registerDesktopConnection({
+        pairingSessionId: pendingIds.pairingSessionId,
+        token,
+        connection,
+      }))
     : service.registerMobileConnection({
       pairId: pendingIds.pairId,
       token,
