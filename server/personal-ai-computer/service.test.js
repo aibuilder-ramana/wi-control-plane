@@ -1,5 +1,8 @@
 const test = require('node:test')
 const assert = require('node:assert/strict')
+const fs = require('fs')
+const os = require('os')
+const path = require('path')
 const { PersonalAiComputerService } = require('./service')
 
 function fakeSocket(label = 'socket', service = null) {
@@ -352,6 +355,55 @@ test('AI_TEST_RESPONSE forwards from desktop bridge to mobile', () => {
   assert.equal(forwarded.payload.text, 'Hello!')
 })
 
+test('a second mobile connection does not replace/close the first', () => {
+  const { service } = createService()
+  const { claimed, mobile: mobileA } = pairDesktopAndMobile(service)
+  const mobileB = fakeSocket('mobileB', service)
+  const connectB = service.registerMobileConnection({
+    pairId: claimed.payload.pairId,
+    token: claimed.payload.mobileWsToken,
+    connection: mobileB,
+  })
+  assert.equal(connectB.ok, true)
+  assert.equal(mobileA.closed, false)
+  assert.equal(mobileB.closed, false)
+})
+
+test('AI_TEST_RESPONSE broadcasts to every connected mobile socket', () => {
+  const { service } = createService()
+  const { claimed, mobile: mobileA, bridge } = pairWithDurableDesktop(service)
+  const mobileB = fakeSocket('mobileB', service)
+  service.registerMobileConnection({
+    pairId: claimed.payload.pairId,
+    token: claimed.payload.mobileWsToken,
+    connection: mobileB,
+  })
+  service.handleSocketMessage(bridge, JSON.stringify({
+    type: 'AI_TEST_RESPONSE',
+    pairId: claimed.payload.pairId,
+    requestId: 'req-broadcast',
+    payload: { model: 'qwen3:32b', text: 'Hello both!' },
+  }))
+  assert.ok(mobileA.sent.find(e => e.type === 'AI_TEST_RESPONSE' && e.requestId === 'req-broadcast'))
+  assert.ok(mobileB.sent.find(e => e.type === 'AI_TEST_RESPONSE' && e.requestId === 'req-broadcast'))
+})
+
+test('mobile presence stays online after one of two tabs disconnects', () => {
+  const { service } = createService()
+  const { claimed, mobile: mobileA } = pairDesktopAndMobile(service)
+  const mobileB = fakeSocket('mobileB', service)
+  service.registerMobileConnection({
+    pairId: claimed.payload.pairId,
+    token: claimed.payload.mobileWsToken,
+    connection: mobileB,
+  })
+  mobileA.close()
+  const pair = service.pairs.get(claimed.payload.pairId)
+  assert.equal(pair.mobileOnline, true)
+  mobileB.close()
+  assert.equal(pair.mobileOnline, false)
+})
+
 test('AI_TEST_ERROR from desktop bridge forwards to mobile', () => {
   const { service } = createService()
   const { claimed, mobile, bridge } = pairWithDurableDesktop(service)
@@ -371,4 +423,38 @@ test('PING from a connection gets a direct PONG reply', () => {
   const { bridge } = pairWithDurableDesktop(service)
   service.handleSocketMessage(bridge, JSON.stringify({ type: 'PING' }))
   assert.equal(bridge.sent.some(e => e.type === 'PONG'), true)
+})
+
+test('a pair survives a process restart when persistencePath is set', () => {
+  const storePath = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'wi-pairs-')), 'pairs.json')
+  const { service: serviceA } = createService({ persistencePath: storePath })
+  const { claimed } = pairWithDurableDesktop(serviceA)
+  const mobileWsToken = claimed.payload.mobileWsToken
+  assert.ok(fs.existsSync(storePath), 'store file should exist after a pair is created')
+
+  // Simulate a full restart: a brand-new service instance, same store path.
+  const { service: serviceB } = createService({ persistencePath: storePath })
+  const restoredPair = serviceB.pairs.get(claimed.payload.pairId)
+  assert.ok(restoredPair, 'pair should be restored from disk')
+  assert.equal(restoredPair.mobileWsTokenHash, serviceA.hashToken(mobileWsToken))
+
+  // A fresh mobile connection using the pre-restart token should still work.
+  const mobile = fakeSocket('mobile-after-restart', serviceB)
+  const reconnect = serviceB.registerMobileConnection({
+    pairId: claimed.payload.pairId,
+    token: mobileWsToken,
+    connection: mobile,
+  })
+  assert.equal(reconnect.ok, true)
+})
+
+test('a disconnected pair stays disconnected across a restart', () => {
+  const storePath = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'wi-pairs-')), 'pairs.json')
+  const { service: serviceA } = createService({ persistencePath: storePath })
+  const { claimed } = pairDesktopAndMobile(serviceA)
+  serviceA.disconnectPair(claimed.payload.pairId, claimed.payload.mobileWsToken)
+
+  const { service: serviceB } = createService({ persistencePath: storePath })
+  const restoredPair = serviceB.pairs.get(claimed.payload.pairId)
+  assert.ok(restoredPair.revokedAt, 'restored pair should still be marked revoked')
 })

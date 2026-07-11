@@ -9,8 +9,12 @@ const { PersonalAiComputerService } = require('./server/personal-ai-computer/ser
 const PORT = Number(process.env.PORT || 3001)
 const PUBLIC_DIR = path.join(__dirname, 'public')
 const pairingTtlMs = Number(process.env.WI_PAIRING_TTL_MS || 5 * 60_000)
+// Defaults to a path under a mounted Railway volume in production (survives
+// redeploys/restarts) and a local ./data dir otherwise; set explicitly via
+// env if the volume is mounted somewhere else.
+const pairsStorePath = process.env.WI_PAIRS_STORE_PATH || path.join(__dirname, 'data', 'pairs.json')
 
-const personalAiComputerService = new PersonalAiComputerService({ pairingTtlMs })
+const personalAiComputerService = new PersonalAiComputerService({ pairingTtlMs, persistencePath: pairsStorePath })
 personalAiComputerService.startHeartbeat()
 
 const MIME_TYPES = {

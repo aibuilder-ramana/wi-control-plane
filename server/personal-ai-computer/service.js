@@ -1,4 +1,5 @@
 const crypto = require('crypto')
+const { loadPairsFromDisk, savePairsToDisk } = require('./store')
 
 // Matches wi-desktop-bridge's own AI_TEST_REQUEST_MAX_BYTES so an oversized
 // prompt is rejected here (cheaply, before waking the desktop) rather than
@@ -29,9 +30,47 @@ class PersonalAiComputerService {
     // Revoked pairs are kept briefly so a final status check still resolves,
     // then dropped so `pairs` doesn't grow without bound.
     this.pairRetentionMs = options.pairRetentionMs || 5 * 60_000
+    // When set, pairs survive a process restart (redeploy, crash) instead of
+    // vanishing with the in-memory Map — see store.js for what's persisted.
+    this.persistencePath = options.persistencePath || null
     this.sessions = new Map()
     this.pairs = new Map()
     this.heartbeatTimer = null
+    if (this.persistencePath) this.loadPersistedPairs()
+  }
+
+  loadPersistedPairs() {
+    for (const record of loadPairsFromDisk(this.persistencePath)) {
+      if (!record || !record.pairId) continue
+      this.pairs.set(record.pairId, {
+        ...record,
+        desktopSocket: null,
+        mobileSockets: new Set(),
+        desktopOnline: false,
+        mobileOnline: false,
+        messageLog: Array.isArray(record.messageLog) ? record.messageLog : [],
+      })
+    }
+  }
+
+  persistPairs() {
+    if (!this.persistencePath) return
+    const serialized = [...this.pairs.values()].map(pair => ({
+      pairId: pair.pairId,
+      pairingSessionId: pair.pairingSessionId,
+      createdAt: pair.createdAt,
+      revokedAt: pair.revokedAt,
+      mobileDeviceId: pair.mobileDeviceId,
+      mobileDeviceName: pair.mobileDeviceName,
+      desktopDeviceName: pair.desktopDeviceName,
+      lastSeenDesktopAt: pair.lastSeenDesktopAt,
+      lastSeenMobileAt: pair.lastSeenMobileAt,
+      mobileWsTokenHash: pair.mobileWsTokenHash,
+      desktopTokenHash: pair.desktopTokenHash,
+      desktopBridgeInfo: pair.desktopBridgeInfo,
+      messageLog: pair.messageLog,
+    }))
+    savePairsToDisk(this.persistencePath, serialized)
   }
 
   startHeartbeat() {
@@ -62,24 +101,28 @@ class PersonalAiComputerService {
     for (const session of this.sessions.values()) checkConnection(session.desktopSocket)
     for (const pair of this.pairs.values()) {
       checkConnection(pair.desktopSocket)
-      checkConnection(pair.mobileSocket)
+      for (const mobileSocket of pair.mobileSockets) checkConnection(mobileSocket)
     }
     this.cleanupExpiredSessions()
     this.cleanupStalePairs()
-    // No persistence layer backs `sessions`/`pairs` (both reset on the next
-    // process restart anyway) and pairs now live until explicitly
-    // disconnected — log size periodically so unbounded growth is at least
-    // observable rather than invisible.
+    // `sessions` are in-memory only (short-lived QR flow, fine to lose on
+    // restart); `pairs` are persisted to disk when persistencePath is set
+    // (see store.js) so a redeploy doesn't silently break every paired
+    // device. Pairs now live until explicitly disconnected — log size
+    // periodically so unbounded growth is at least observable.
     console.log(`wi-control-plane heartbeat: sessions=${this.sessions.size} pairs=${this.pairs.size}`)
   }
 
   cleanupStalePairs() {
     const current = this.now()
+    let removed = false
     for (const [pairId, pair] of this.pairs.entries()) {
       if (pair.revokedAt && current - new Date(pair.revokedAt).getTime() > this.pairRetentionMs) {
         this.pairs.delete(pairId)
+        removed = true
       }
     }
+    if (removed) this.persistPairs()
   }
 
   createPairingSession() {
@@ -147,7 +190,12 @@ class PersonalAiComputerService {
       lastSeenDesktopAt: session.desktopSocket && !session.desktopSocket.closed ? nowIso(this.now) : null,
       lastSeenMobileAt: null,
       desktopSocket: session.desktopSocket || null,
-      mobileSocket: null,
+      // A pair now supports multiple simultaneous mobile connections (e.g.
+      // several browser tabs/visitors sharing one hardwired pair) instead of
+      // one replacing the other. AI_TEST_RESPONSE/ERROR and PRESENCE are
+      // broadcast to all of them; each client already ignores requestIds it
+      // didn't send, so broadcasting is safe without per-request routing.
+      mobileSockets: new Set(),
       mobileWsTokenHash: this.hashToken(mobileWsToken),
       desktopTokenHash: this.hashToken(desktopToken),
       desktopBridgeInfo: null,
@@ -156,6 +204,7 @@ class PersonalAiComputerService {
     session.claimedAt = nowIso(this.now)
     session.pairId = pairId
     this.pairs.set(pairId, pair)
+    this.persistPairs()
 
     if (pair.desktopSocket) {
       pair.desktopSocket.meta = { role: 'desktop', pairId, pairingSessionId }
@@ -276,10 +325,7 @@ class PersonalAiComputerService {
       return { ok: false, status: 401, error: 'invalid_mobile_ws_token' }
     }
 
-    if (pair.mobileSocket && pair.mobileSocket !== connection) {
-      pair.mobileSocket.close(1000, 'replaced')
-    }
-    pair.mobileSocket = connection
+    pair.mobileSockets.add(connection)
     pair.mobileOnline = true
     pair.lastSeenMobileAt = nowIso(this.now)
     connection.meta = { role: 'mobile', pairId, pairingSessionId: pair.pairingSessionId }
@@ -318,17 +364,20 @@ class PersonalAiComputerService {
     pair.lastSeenMobileAt = pair.lastSeenMobileAt || nowIso(this.now)
     const event = { reason, pairId: pair.pairId }
     this.sendEvent(pair.desktopSocket, 'PAIR_DISCONNECTED', event)
-    this.sendEvent(pair.mobileSocket, 'PAIR_DISCONNECTED', event)
     if (pair.desktopSocket) pair.desktopSocket.close(1000, reason)
-    if (pair.mobileSocket) pair.mobileSocket.close(1000, reason)
+    for (const mobileSocket of pair.mobileSockets) {
+      this.sendEvent(mobileSocket, 'PAIR_DISCONNECTED', event)
+      mobileSocket.close(1000, reason)
+    }
     pair.desktopSocket = null
-    pair.mobileSocket = null
+    pair.mobileSockets.clear()
     const session = this.sessions.get(pair.pairingSessionId)
     if (session) {
       session.revokedAt = pair.revokedAt
       session.desktopSocket = null
       session.desktopOnline = false
     }
+    this.persistPairs()
     return { ok: true, status: 200, payload: { ok: true, pairId: pair.pairId, status: 'disconnected' } }
   }
 
@@ -395,9 +444,8 @@ class PersonalAiComputerService {
     }
     if (meta.role === 'mobile') {
       const pair = this.pairs.get(meta.pairId)
-      if (pair && pair.mobileSocket === connection) {
-        pair.mobileSocket = null
-        pair.mobileOnline = false
+      if (pair && pair.mobileSockets.delete(connection)) {
+        pair.mobileOnline = pair.mobileSockets.size > 0
         this.sendPresence(pair)
       }
     }
@@ -436,8 +484,11 @@ class PersonalAiComputerService {
     pair.messageLog.push(event)
     if (pair.messageLog.length > 50) pair.messageLog.shift()
     this.sendEvent(connection, 'TEST_MESSAGE', event)
-    const peer = sender === 'desktop' ? pair.mobileSocket : pair.desktopSocket
-    if (peer) this.sendEvent(peer, 'TEST_MESSAGE', event)
+    if (sender === 'desktop') {
+      for (const mobileSocket of pair.mobileSockets) this.sendEvent(mobileSocket, 'TEST_MESSAGE', event)
+    } else if (pair.desktopSocket) {
+      this.sendEvent(pair.desktopSocket, 'TEST_MESSAGE', event)
+    }
     this.sendPresence(pair)
   }
 
@@ -490,13 +541,18 @@ class PersonalAiComputerService {
     const meta = connection.meta || {}
     if (meta.role !== 'desktop') return
     const pair = this.pairs.get(meta.pairId)
-    if (!pair || pair.revokedAt || !pair.mobileSocket || pair.mobileSocket.closed) return
+    if (!pair || pair.revokedAt || pair.mobileSockets.size === 0) return
     const requestId = String((message && message.requestId) || '')
-    this.sendEvent(pair.mobileSocket, message.type, {
-      pairId: pair.pairId,
-      requestId,
-      payload: (message && message.payload) || {},
-    })
+    // Broadcast rather than route to a single originating socket: each
+    // mobile client tracks its own pending requestIds and ignores ones it
+    // didn't send, so this is safe with multiple concurrent tabs/visitors.
+    for (const mobileSocket of pair.mobileSockets) {
+      this.sendEvent(mobileSocket, message.type, {
+        pairId: pair.pairId,
+        requestId,
+        payload: (message && message.payload) || {},
+      })
+    }
   }
 
   // Informational only — lets the mobile side eventually show which model
@@ -528,7 +584,7 @@ class PersonalAiComputerService {
       messages: pair.messageLog,
     }
     this.sendEvent(pair.desktopSocket, 'PRESENCE', payload)
-    this.sendEvent(pair.mobileSocket, 'PRESENCE', payload)
+    for (const mobileSocket of pair.mobileSockets) this.sendEvent(mobileSocket, 'PRESENCE', payload)
   }
 
   sendEvent(connection, type, payload) {
