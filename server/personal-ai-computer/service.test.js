@@ -448,6 +448,63 @@ test('a pair survives a process restart when persistencePath is set', () => {
   assert.equal(reconnect.ok, true)
 })
 
+test('a durable bridge connecting evicts an existing connect.html desktop with DESKTOP_REPLACED', () => {
+  // Reproduces the reported "online/offline flapping": a connect.html tab
+  // and a headless bridge both alive for the same pair used to silently
+  // clobber each other (close(1000,'replaced') with no distinguishing
+  // signal), so the loser would just blindly reconnect and re-fight for the
+  // slot. The loser must now be told explicitly so it can stand down.
+  const { service } = createService()
+  const { session, claimed, desktop: browserTab } = pairDesktopAndMobile(service)
+  const desktopToken = browserTab.sent.find(e => e.type === 'PAIR_CONFIRMED' && e.desktopToken).desktopToken
+
+  const bridge = fakeSocket('bridge', service)
+  const result = service.registerDesktopConnectionByPair({
+    pairId: claimed.payload.pairId,
+    token: desktopToken,
+    connection: bridge,
+  })
+
+  assert.equal(result.ok, true)
+  assert.equal(browserTab.closed, true)
+  assert.equal(browserTab.sent.some(e => e.type === 'ERROR' && e.code === 'DESKTOP_REPLACED'), true)
+  assert.equal(service.pairs.get(claimed.payload.pairId).desktopSocket, bridge)
+  void session
+})
+
+test('a connect.html tab reconnecting evicts an existing durable bridge with DESKTOP_REPLACED', () => {
+  const { service } = createService()
+  const { session, claimed, bridge } = pairWithDurableDesktop(service)
+
+  const newBrowserTab = fakeSocket('newTab', service)
+  const result = service.registerDesktopConnection({
+    pairingSessionId: session.pairingSessionId,
+    token: session.desktopSessionToken,
+    connection: newBrowserTab,
+  })
+
+  assert.equal(result.ok, true)
+  assert.equal(bridge.closed, true)
+  assert.equal(bridge.sent.some(e => e.type === 'ERROR' && e.code === 'DESKTOP_REPLACED'), true)
+  assert.equal(service.pairs.get(claimed.payload.pairId).desktopSocket, newBrowserTab)
+})
+
+test('a second connect.html reconnect on the same session evicts the first with DESKTOP_REPLACED', () => {
+  const { service } = createService()
+  const { session, desktop: firstTab } = pairDesktopAndMobile(service)
+
+  const secondTab = fakeSocket('secondTab', service)
+  const result = service.registerDesktopConnection({
+    pairingSessionId: session.pairingSessionId,
+    token: session.desktopSessionToken,
+    connection: secondTab,
+  })
+
+  assert.equal(result.ok, true)
+  assert.equal(firstTab.closed, true)
+  assert.equal(firstTab.sent.some(e => e.type === 'ERROR' && e.code === 'DESKTOP_REPLACED'), true)
+})
+
 test('a disconnected pair stays disconnected across a restart', () => {
   const storePath = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'wi-pairs-')), 'pairs.json')
   const { service: serviceA } = createService({ persistencePath: storePath })

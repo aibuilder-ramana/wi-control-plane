@@ -94,6 +94,11 @@
       align-items: center;
       justify-content: center;
       min-height: 300px;
+      transition: opacity 0.2s ease;
+    }
+
+    .qr-wrap.used {
+      opacity: 0.25;
     }
 
     .hint {
@@ -101,6 +106,11 @@
       font-size: 13px;
       color: var(--muted);
       overflow-wrap: anywhere;
+    }
+
+    .hint.used-hint {
+      color: var(--amber);
+      font-weight: 600;
     }
 
     .stack {
@@ -256,7 +266,8 @@
       <div id="desktopBadge" class="badge">Waiting for phone</div>
       <h1>Connect to your Personal AI Computer</h1>
       <p>Keep this page open, then scan the QR code from Wi on your phone.</p>
-      <div class="qr-wrap"><canvas id="qrCanvas" width="280" height="280"></canvas></div>
+      <div class="qr-wrap" id="qrWrap"><canvas id="qrCanvas" width="280" height="280"></canvas></div>
+      <div class="hint used-hint hidden" id="qrUsedHint">This QR code has already been paired and won't work for another device. Click "New QR session" below to get a fresh one.</div>
       <div class="hint" id="qrText"></div>
       <div class="hint" id="expiryText"></div>
     </section>
@@ -308,6 +319,19 @@
   </div>
 
   <script>
+    // Errors that mean the current credentials (session or durable pair
+    // token) are permanently dead — retrying with the same ones would just
+    // fail the same way forever, so auto-reconnect must stop and ask for a
+    // fresh QR scan instead of looping. Mirrors the mobile app's own
+    // TERMINAL_ERROR_CODES (PersonalAiComputerClient.kt) for the same reason.
+    const TERMINAL_DESKTOP_ERROR_CODES = new Set([
+      'PAIRING_SESSION_NOT_FOUND', 'PAIRING_SESSION_REVOKED', 'PAIRING_SESSION_EXPIRED', 'PAIRING_EXPIRED',
+      'INVALID_DESKTOP_SESSION_TOKEN', 'PAIR_NOT_FOUND', 'PAIR_REVOKED', 'INVALID_DESKTOP_TOKEN',
+      'AUTH_REQUIRED', 'AUTH_TIMEOUT',
+    ]);
+    const RECONNECT_BASE_DELAY_MS = 2000;
+    const RECONNECT_MAX_DELAY_MS = 30000;
+
     const state = {
       pairingSessionId: '',
       desktopSessionToken: '',
@@ -319,6 +343,14 @@
       desktopOnline: false,
       mobileOnline: false,
       mobileDeviceName: 'Wi Mobile',
+      // Auto-reconnect is on by default and only turned off by an explicit
+      // user action (New QR session, Disconnect pair) or a terminal
+      // server error — not by a plain close/error, which is exactly the gap
+      // that made a dropped connection look "offline" forever until someone
+      // noticed and reloaded the page.
+      autoReconnect: false,
+      reconnectAttempt: 0,
+      reconnectTimer: null,
     };
 
     const els = {
@@ -326,6 +358,8 @@
       desktopStatus: document.getElementById('desktopStatus'),
       mobileStatus: document.getElementById('mobileStatus'),
       qrCanvas: document.getElementById('qrCanvas'),
+      qrWrap: document.getElementById('qrWrap'),
+      qrUsedHint: document.getElementById('qrUsedHint'),
       qrText: document.getElementById('qrText'),
       expiryText: document.getElementById('expiryText'),
       messageInput: document.getElementById('messageInput'),
@@ -397,6 +431,16 @@
         .replace(/>/g, '&gt;');
     }
 
+    function markQrAsUsed() {
+      els.qrWrap.classList.add('used');
+      els.qrUsedHint.classList.remove('hidden');
+    }
+
+    function markQrAsFresh() {
+      els.qrWrap.classList.remove('used');
+      els.qrUsedHint.classList.add('hidden');
+    }
+
     function handleSocketEvent(event) {
       const message = JSON.parse(event.data);
       if (message.type === 'DESKTOP_READY') {
@@ -415,6 +459,12 @@
           els.bridgeDesktopToken.textContent = state.desktopToken;
           els.bridgeSetupCard.classList.remove('hidden');
         }
+        // The QR still on screen is this same pairingSessionId — scanning it
+        // again now just fails with "already claimed" (a phone re-scanning it
+        // to "reconnect", instead of using Wi's own Reconnect button, was
+        // exactly the confusing dead end reported). Mark it visibly used so
+        // nobody scans it a second time expecting it to work.
+        markQrAsUsed();
         setError('');
         renderStatus({ desktopOnline: true, mobileOnline: state.mobileOnline });
         return;
@@ -432,17 +482,40 @@
         return;
       }
       if (message.type === 'PAIR_DISCONNECTED') {
+        stopAutoReconnect();
         setError(message.reason || 'Pair disconnected');
         renderStatus({ desktopOnline: false, mobileOnline: false });
         return;
       }
       if (message.type === 'ERROR') {
-        setError(message.message || message.code || 'Connection error');
+        const code = String(message.code || '');
+        if (code === 'DESKTOP_REPLACED') {
+          // Another connection (a second tab, or a headless bridge) just
+          // took over this same pairing. Reconnecting now would only kick
+          // it right back off — that fight is exactly what used to show up
+          // as "switching continuously between online and offline". Stand
+          // down instead; reload or start a new QR session to take the
+          // slot back.
+          stopAutoReconnect();
+          setError('This pairing is now connected from another window or bridge. Reload this page to reconnect here.');
+          renderStatus({ desktopOnline: false, mobileOnline: state.mobileOnline });
+          return;
+        }
+        if (TERMINAL_DESKTOP_ERROR_CODES.has(code)) {
+          stopAutoReconnect();
+          setError(message.message || 'This session is no longer valid — click "New QR session".');
+          renderStatus({ desktopOnline: false, mobileOnline: false });
+          return;
+        }
+        setError(message.message || code || 'Connection error');
       }
     }
 
     async function createSession() {
+      stopAutoReconnect();
+      state.autoReconnect = true;
       setError('');
+      markQrAsFresh();
       renderStatus({ desktopOnline: false, mobileOnline: false });
       state.messages = [];
       renderMessages();
@@ -467,28 +540,90 @@
     }
 
     function openDesktopSocket() {
-      // The pairing/session id is just an identifier; the desktop session
-      // token is the actual credential and is sent as the first WS message
-      // instead of a query param, so it never lands in access/proxy logs.
-      const query = new URLSearchParams({ session: state.pairingSessionId });
+      // Prefer the durable pairId + desktopToken path once we have one (set
+      // after PAIR_CONFIRMED) — unlike the session path, this keeps working
+      // across a control-plane restart, since sessions are in-memory only
+      // but pairs are persisted (see wi-control-plane/server/.../store.js).
+      // The pairing/session id and pairId are just identifiers; the actual
+      // credential (desktopSessionToken or desktopToken) is sent as the
+      // first WS message instead of a query param, so it never lands in
+      // access/proxy logs.
+      const useDurablePath = Boolean(state.pairId && state.desktopToken);
+      const query = new URLSearchParams(
+        useDurablePath ? { pairId: state.pairId } : { session: state.pairingSessionId },
+      );
       const socket = new WebSocket(`${wsUrl('/v1/ws/desktop')}?${query.toString()}`);
       state.desktopSocket = socket;
+      // Each handler below only acts if `socket` is still state.desktopSocket
+      // — otherwise this is a stale/already-replaced connection (e.g. one
+      // superseded by a newer reconnect) reporting a late close/error, which
+      // must not be allowed to scheduleReconnect() and tear down whatever
+      // now-current connection replaced it. See the identical guard and full
+      // explanation in the mobile app's PersonalAiComputerClient.openMobileSocket.
+      const isCurrent = () => socket === state.desktopSocket;
       socket.addEventListener('open', () => {
-        socket.send(JSON.stringify({ type: 'AUTH', token: state.desktopSessionToken }));
+        if (!isCurrent()) return;
+        state.reconnectAttempt = 0;
+        socket.send(JSON.stringify({
+          type: 'AUTH',
+          token: useDurablePath ? state.desktopToken : state.desktopSessionToken,
+        }));
         renderStatus({ desktopOnline: true, mobileOnline: state.mobileOnline });
       });
-      socket.addEventListener('message', handleSocketEvent);
-      socket.addEventListener('close', () => renderStatus({ desktopOnline: false, mobileOnline: false }));
-      socket.addEventListener('error', () => setError('Desktop socket failed.'));
+      socket.addEventListener('message', (event) => {
+        if (!isCurrent()) return;
+        handleSocketEvent(event);
+      });
+      socket.addEventListener('close', () => {
+        if (!isCurrent()) return;
+        renderStatus({ desktopOnline: false, mobileOnline: false });
+        scheduleReconnect();
+      });
+      socket.addEventListener('error', () => {
+        if (!isCurrent()) return;
+        setError('Desktop socket failed.');
+        renderStatus({ desktopOnline: false, mobileOnline: false });
+        scheduleReconnect();
+      });
+    }
+
+    // Exponential backoff (2s, 4s, 8s, 16s, 30s cap) — mirrors the mobile
+    // app's own PersonalAiComputerClient.scheduleReconnect so neither side
+    // hammers the other. A plain close/error must not leave this page
+    // stuck showing "Offline" until someone notices and reloads, which was
+    // the main reported symptom (no reconnect logic existed at all before).
+    function scheduleReconnect() {
+      if (!state.autoReconnect || state.reconnectTimer) return;
+      const attempt = ++state.reconnectAttempt;
+      const delayMs = Math.min(RECONNECT_MAX_DELAY_MS, RECONNECT_BASE_DELAY_MS * (2 ** Math.min(attempt - 1, 4)));
+      setError(`Reconnecting in ${Math.round(delayMs / 1000)}s…`);
+      state.reconnectTimer = setTimeout(() => {
+        state.reconnectTimer = null;
+        if (state.autoReconnect) openDesktopSocket();
+      }, delayMs);
+    }
+
+    function stopAutoReconnect() {
+      state.autoReconnect = false;
+      state.reconnectAttempt = 0;
+      if (state.reconnectTimer) {
+        clearTimeout(state.reconnectTimer);
+        state.reconnectTimer = null;
+      }
     }
 
     async function disconnectPair() {
       if (!state.pairId) return;
+      stopAutoReconnect();
+      // Prefer the durable token if we have one: it stays valid across a
+      // control-plane restart (persisted), unlike desktopSessionToken which
+      // only authorizes as long as the original in-memory session survives.
+      const authToken = state.desktopToken || state.desktopSessionToken;
       const response = await fetch(`/v1/pairs/${encodeURIComponent(state.pairId)}/disconnect`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          'Authorization': `Bearer ${state.desktopSessionToken}`,
+          'Authorization': `Bearer ${authToken}`,
         },
         body: JSON.stringify({ reason: 'desktop_disconnect' }),
       });

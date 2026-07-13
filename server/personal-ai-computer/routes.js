@@ -50,7 +50,13 @@ function humanizeError(code) {
     case 'pairing_session_not_found': return 'This pairing session does not exist.'
     case 'pairing_session_revoked': return 'This pairing session has already been revoked.'
     case 'pairing_session_expired': return 'This QR code has expired.'
-    case 'pairing_session_already_claimed': return 'This QR code has already been claimed.'
+    // This fires when a phone re-scans a QR code that's still on screen after
+    // already pairing with it — the desktop page doesn't auto-rotate its QR
+    // once claimed, so re-scanning the same one always hits this. The fix is
+    // "Reconnect" (reuses the existing pair) or a fresh QR, not re-scanning
+    // the stale one — say so explicitly instead of just "already claimed",
+    // which reads as a dead end.
+    case 'pairing_session_already_claimed': return 'This QR code was already used to pair. If you\'re reconnecting the same pair, use "Reconnect" instead of scanning again — or click "New QR session" on the desktop for a fresh code.'
     case 'invalid_one_time_token': return 'This QR code token is invalid.'
     case 'pair_not_found': return 'This pair could not be found.'
     case 'pair_revoked': return 'This pair has already been disconnected.'

@@ -14,6 +14,17 @@ const pairingTtlMs = Number(process.env.WI_PAIRING_TTL_MS || 5 * 60_000)
 // env if the volume is mounted somewhere else.
 const pairsStorePath = process.env.WI_PAIRS_STORE_PATH || path.join(__dirname, 'data', 'pairs.json')
 
+// Logged once at boot, not asserted — this process has no way to tell
+// whether pairsStorePath actually sits on a persistent volume. Without
+// WI_PAIRS_STORE_PATH set, it defaults to a path inside the deployed code
+// directory, which most container platforms (including Railway without an
+// explicitly attached volume) wipe on every redeploy/restart — silently
+// undoing the persistence this code is trying to provide. Check these lines
+// in the Railway logs after a redeploy: existed=true means the file (and
+// therefore every paired device) survived; existed=false means it didn't.
+console.log(`wi-control-plane: pairs store path = ${pairsStorePath} (WI_PAIRS_STORE_PATH ${process.env.WI_PAIRS_STORE_PATH ? 'set' : 'NOT set, using default'})`)
+console.log(`wi-control-plane: pairs store existed at boot = ${fs.existsSync(pairsStorePath)}`)
+
 const personalAiComputerService = new PersonalAiComputerService({ pairingTtlMs, persistencePath: pairsStorePath })
 personalAiComputerService.startHeartbeat()
 

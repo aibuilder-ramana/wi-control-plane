@@ -245,9 +245,7 @@ class PersonalAiComputerService {
       return { ok: false, status: 401, error: 'invalid_desktop_session_token' }
     }
 
-    if (session.desktopSocket && session.desktopSocket !== connection) {
-      session.desktopSocket.close(1000, 'replaced')
-    }
+    this.evictDesktopSocket(session.desktopSocket, connection)
     session.desktopSocket = connection
     session.desktopOnline = true
     session.lastSeenDesktopAt = nowIso(this.now)
@@ -262,6 +260,7 @@ class PersonalAiComputerService {
     if (session.pairId) {
       const pair = this.pairs.get(session.pairId)
       if (pair && !pair.revokedAt) {
+        this.evictDesktopSocket(pair.desktopSocket, connection)
         pair.desktopSocket = connection
         pair.desktopOnline = true
         pair.lastSeenDesktopAt = nowIso(this.now)
@@ -283,9 +282,11 @@ class PersonalAiComputerService {
   // against an established pair's desktopTokenHash instead of a pairing
   // session, so a headless desktop client can reconnect after restarting
   // using only the pairId + desktopToken it was given once at claim time.
-  // Note: a connect.html tab (session-based) and a durable-token client can
-  // both claim `pair.desktopSocket` independently — whichever registers last
-  // wins the slot, the other is left orphaned. Known MVP limitation.
+  // A connect.html tab (session-based) and a durable-token client can both
+  // claim `pair.desktopSocket` independently — whichever registers last wins
+  // the slot. The loser is told explicitly via DESKTOP_REPLACED (see
+  // evictDesktopSocket) instead of just being dropped, so it can stop
+  // retrying instead of fighting the winner for the slot.
   registerDesktopConnectionByPair(input) {
     const pairId = String(input.pairId || '')
     const token = String(input.token || '')
@@ -297,9 +298,7 @@ class PersonalAiComputerService {
       return { ok: false, status: 401, error: 'invalid_desktop_token' }
     }
 
-    if (pair.desktopSocket && pair.desktopSocket !== connection) {
-      pair.desktopSocket.close(1000, 'replaced')
-    }
+    this.evictDesktopSocket(pair.desktopSocket, connection)
     pair.desktopSocket = connection
     pair.desktopOnline = true
     pair.lastSeenDesktopAt = nowIso(this.now)
@@ -595,6 +594,22 @@ class PersonalAiComputerService {
 
   sendError(connection, code, message) {
     this.sendEvent(connection, 'ERROR', { code, message })
+  }
+
+  // A plain close(1000, 'replaced') is indistinguishable from a random
+  // network drop to the client that just lost the slot — it has no way to
+  // know another connection took over, so it just reconnects and re-claims
+  // the slot, which fights whichever connection just won it (this was the
+  // "online/offline flapping" reported when a connect.html tab and a
+  // headless bridge were both alive for the same pair). Telling the loser
+  // explicitly via a distinct error code lets it stand down instead.
+  evictDesktopSocket(existingSocket, newConnection) {
+    if (!existingSocket || existingSocket === newConnection || existingSocket.closed) return
+    this.sendEvent(existingSocket, 'ERROR', {
+      code: 'DESKTOP_REPLACED',
+      message: 'Another connection took over this desktop pairing.',
+    })
+    existingSocket.close(1000, 'replaced')
   }
 
   authorizePair(pairId, authToken) {
