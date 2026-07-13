@@ -612,6 +612,32 @@
       }
     }
 
+    // The browser (or OS) telling us connectivity just came back, or the tab
+    // becoming visible again after being backgrounded/the laptop waking from
+    // sleep, is a strong signal that whatever socket we had is already dead
+    // and there's no reason to wait out a pending backoff delay — reconnect
+    // immediately, the way WhatsApp Web resumes the instant the network
+    // returns instead of sitting on "Offline" until the next scheduled retry.
+    function forceReconnectNow() {
+      if (!state.autoReconnect) return;
+      if (state.desktopSocket && state.desktopSocket.readyState === WebSocket.OPEN) return;
+      if (state.reconnectTimer) {
+        clearTimeout(state.reconnectTimer);
+        state.reconnectTimer = null;
+      }
+      state.reconnectAttempt = 0;
+      openDesktopSocket();
+    }
+
+    window.addEventListener('online', forceReconnectNow);
+    window.addEventListener('offline', () => {
+      renderStatus({ desktopOnline: false, mobileOnline: state.mobileOnline });
+      setError('Network offline — will reconnect automatically once it returns.');
+    });
+    document.addEventListener('visibilitychange', () => {
+      if (document.visibilityState === 'visible') forceReconnectNow();
+    });
+
     async function disconnectPair() {
       if (!state.pairId) return;
       stopAutoReconnect();
