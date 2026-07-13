@@ -89,6 +89,24 @@ async function handlePersonalAiComputerRoute(req, res, url, body, service, sendJ
     return true
   }
 
+  // Stateless HTTP counterpart to the WS-based AI_TEST_REQUEST flow — lets a
+  // mobile client ask its paired Personal AI a question with a single POST
+  // instead of holding a live WebSocket open just to receive the answer.
+  // Still relays over the existing live desktop socket underneath
+  // (askViaHttp); only the mobile side becomes request/response.
+  const askMatch = url.pathname.match(/^\/v1\/pairs\/([^/]+)\/ask$/)
+  if (req.method === 'POST' && askMatch) {
+    const parsed = readJson(body)
+    const result = await service.askViaHttp(
+      askMatch[1],
+      bearerToken(req),
+      parsed && parsed.prompt,
+      parsed && parsed.timeoutMs,
+    )
+    sendJson(req, res, result.status, result.ok ? result.payload : errorBody(result.error, humanizeError(result.error)))
+    return true
+  }
+
   const disconnectMatch = url.pathname.match(/^\/v1\/pairs\/([^/]+)\/disconnect$/)
   if (req.method === 'POST' && disconnectMatch) {
     let reason = 'user_disconnected'

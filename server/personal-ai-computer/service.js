@@ -35,6 +35,11 @@ class PersonalAiComputerService {
     this.persistencePath = options.persistencePath || null
     this.sessions = new Map()
     this.pairs = new Map()
+    // AI_TEST_REQUESTs made via the stateless HTTP ask() path (askViaHttp)
+    // instead of a live mobile WebSocket — see askViaHttp/forwardAiTestResult.
+    // Keyed by requestId, same as the WS-broadcast path, but resolved with an
+    // HTTP response instead of a socket send.
+    this.pendingHttpAsks = new Map()
     this.heartbeatTimer = null
     if (this.persistencePath) this.loadPersistedPairs()
   }
@@ -343,6 +348,13 @@ class PersonalAiComputerService {
         pairId: pair.pairId,
         desktopOnline: pair.desktopOnline,
         mobileOnline: pair.mobileOnline,
+        // True only once the connected desktop has identified itself as a
+        // real answering bridge (BRIDGE_READY/BRIDGE_HEALTH — see
+        // handleBridgeStatus), not merely "some desktop-role socket is
+        // connected" — connect.html's manual test page never sends this, so
+        // it correctly reports false even while desktopOnline is true.
+        desktopBridgeReady: Boolean(pair.desktopBridgeInfo),
+        desktopBridgeInfo: pair.desktopBridgeInfo || null,
         status: pair.revokedAt ? 'disconnected' : 'paired',
         desktopDeviceName: pair.desktopDeviceName,
         mobileDeviceName: pair.mobileDeviceName,
@@ -534,14 +546,91 @@ class PersonalAiComputerService {
     })
   }
 
+  // Stateless HTTP counterpart to forwardAiTestRequest — lets a mobile client
+  // ask a question with a single POST instead of holding a live WebSocket
+  // open just to receive the eventual answer. Still relays over the SAME
+  // live desktop socket (unchanged); only the mobile side of the relay
+  // becomes request/response instead of socket-based. Resolves the returned
+  // Promise itself (from forwardAiTestResult, once the desktop answers, or
+  // from the timeout below) rather than emitting anything over a socket —
+  // routes.js awaits this and writes the HTTP response directly.
+  askViaHttp(pairId, authToken, prompt, timeoutMs) {
+    return new Promise(resolve => {
+      const auth = this.authorizePair(pairId, authToken)
+      if (!auth.ok) {
+        resolve({ ok: false, status: auth.status, error: auth.error })
+        return
+      }
+      const pair = auth.pair
+      const cleanPrompt = String(prompt || '').trim()
+      if (!cleanPrompt || Buffer.byteLength(cleanPrompt, 'utf8') > AI_TEST_REQUEST_MAX_BYTES) {
+        resolve({ ok: true, status: 200, payload: { success: false, code: 'INVALID_PROMPT', message: 'Prompt is missing or too large.' } })
+        return
+      }
+      pair.lastSeenMobileAt = nowIso(this.now)
+      if (!pair.desktopSocket || pair.desktopSocket.closed) {
+        resolve({ ok: true, status: 200, payload: { success: false, code: 'DESKTOP_OFFLINE', message: 'Your Personal AI Computer is offline.' } })
+        return
+      }
+      const requestId = this.id('httpask')
+      const boundedTimeoutMs = Math.min(Math.max(Number(timeoutMs) || 60_000, 1_000), 120_000)
+      const timer = setTimeout(() => {
+        this.pendingHttpAsks.delete(requestId)
+        resolve({ ok: true, status: 200, payload: { success: false, code: 'LLM_TIMEOUT', message: 'Your Personal AI Computer did not respond in time.' } })
+      }, boundedTimeoutMs)
+      if (typeof timer.unref === 'function') timer.unref()
+      this.pendingHttpAsks.set(requestId, { resolve, timer })
+      this.sendEvent(pair.desktopSocket, 'AI_TEST_REQUEST', {
+        pairId: pair.pairId,
+        requestId,
+        payload: { prompt: cleanPrompt },
+      })
+    })
+  }
+
   // Desktop → mobile. pairId is re-keyed from the server-trusted connection
   // meta, not the desktop bridge's own claimed message.pairId.
   forwardAiTestResult(connection, message) {
     const meta = connection.meta || {}
     if (meta.role !== 'desktop') return
     const pair = this.pairs.get(meta.pairId)
-    if (!pair || pair.revokedAt || pair.mobileSockets.size === 0) return
+    if (!pair) return
     const requestId = String((message && message.requestId) || '')
+
+    // An HTTP-ask caller (askViaHttp) is waiting on this exact requestId —
+    // resolve its Promise directly instead of broadcasting to WS-connected
+    // mobile peers. requestIds are server-generated and prefixed distinctly
+    // per path (httpask_ vs the WS clients' own req_/etc.), so there's no
+    // collision risk between the two correlation maps.
+    const pendingHttp = this.pendingHttpAsks.get(requestId)
+    if (pendingHttp) {
+      this.pendingHttpAsks.delete(requestId)
+      clearTimeout(pendingHttp.timer)
+      if (message.type === 'AI_TEST_RESPONSE') {
+        pendingHttp.resolve({
+          ok: true,
+          status: 200,
+          payload: {
+            success: true,
+            text: String(message.payload?.text || ''),
+            model: String(message.payload?.model || ''),
+          },
+        })
+      } else {
+        pendingHttp.resolve({
+          ok: true,
+          status: 200,
+          payload: {
+            success: false,
+            code: String(message.payload?.code || 'LLM_ERROR'),
+            message: String(message.payload?.message || "Your Personal AI Computer couldn't answer that."),
+          },
+        })
+      }
+      return
+    }
+
+    if (pair.revokedAt || pair.mobileSockets.size === 0) return
     // Broadcast rather than route to a single originating socket: each
     // mobile client tracks its own pending requestIds and ignores ones it
     // didn't send, so this is safe with multiple concurrent tabs/visitors.

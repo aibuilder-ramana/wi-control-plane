@@ -515,3 +515,126 @@ test('a disconnected pair stays disconnected across a restart', () => {
   const restoredPair = serviceB.pairs.get(claimed.payload.pairId)
   assert.ok(restoredPair.revokedAt, 'restored pair should still be marked revoked')
 })
+
+// ── askViaHttp: the stateless HTTP relay replacing the mobile-side WebSocket ──
+
+test('askViaHttp relays a prompt over the existing desktop socket and resolves with the answer', async () => {
+  const { service } = createService()
+  const { claimed, desktop } = pairDesktopAndMobile(service)
+  desktop.meta = { role: 'desktop', pairId: claimed.payload.pairId }
+
+  const askPromise = service.askViaHttp(claimed.payload.pairId, claimed.payload.mobileWsToken, 'Say hello', 5000)
+  const forwarded = desktop.sent.find(e => e.type === 'AI_TEST_REQUEST')
+  assert.ok(forwarded, 'desktop should receive an AI_TEST_REQUEST')
+  assert.equal(forwarded.payload.prompt, 'Say hello')
+
+  service.handleSocketMessage(desktop, JSON.stringify({
+    type: 'AI_TEST_RESPONSE',
+    pairId: claimed.payload.pairId,
+    requestId: forwarded.requestId,
+    payload: { text: 'Hello!', model: 'qwen3:32b' },
+  }))
+
+  const result = await askPromise
+  assert.equal(result.ok, true)
+  assert.equal(result.payload.success, true)
+  assert.equal(result.payload.text, 'Hello!')
+  assert.equal(result.payload.model, 'qwen3:32b')
+})
+
+test('askViaHttp resolves with DESKTOP_OFFLINE when no desktop bridge is connected', async () => {
+  const { service } = createService()
+  const { claimed, desktop } = pairDesktopAndMobile(service)
+  desktop.close()
+
+  const result = await service.askViaHttp(claimed.payload.pairId, claimed.payload.mobileWsToken, 'Say hello', 5000)
+  assert.equal(result.ok, true)
+  assert.equal(result.payload.success, false)
+  assert.equal(result.payload.code, 'DESKTOP_OFFLINE')
+})
+
+test('askViaHttp resolves with LLM_TIMEOUT when the desktop never answers', async () => {
+  const { service } = createService()
+  const { claimed, desktop } = pairDesktopAndMobile(service)
+  desktop.meta = { role: 'desktop', pairId: claimed.payload.pairId }
+
+  const result = await service.askViaHttp(claimed.payload.pairId, claimed.payload.mobileWsToken, 'Say hello', 30)
+  assert.equal(result.ok, true)
+  assert.equal(result.payload.success, false)
+  assert.equal(result.payload.code, 'LLM_TIMEOUT')
+})
+
+test('askViaHttp forwards an AI_TEST_ERROR from the desktop as a failed (not success) result', async () => {
+  const { service } = createService()
+  const { claimed, desktop } = pairDesktopAndMobile(service)
+  desktop.meta = { role: 'desktop', pairId: claimed.payload.pairId }
+
+  const askPromise = service.askViaHttp(claimed.payload.pairId, claimed.payload.mobileWsToken, 'Say hello', 5000)
+  const forwarded = desktop.sent.find(e => e.type === 'AI_TEST_REQUEST')
+
+  service.handleSocketMessage(desktop, JSON.stringify({
+    type: 'AI_TEST_ERROR',
+    pairId: claimed.payload.pairId,
+    requestId: forwarded.requestId,
+    payload: { code: 'OLLAMA_UNAVAILABLE', message: 'Could not reach Ollama.' },
+  }))
+
+  const result = await askPromise
+  assert.equal(result.payload.success, false)
+  assert.equal(result.payload.code, 'OLLAMA_UNAVAILABLE')
+})
+
+test('askViaHttp rejects an invalid token without touching the desktop', async () => {
+  const { service } = createService()
+  const { claimed, desktop } = pairDesktopAndMobile(service)
+
+  const result = await service.askViaHttp(claimed.payload.pairId, 'wrong-token', 'Say hello', 5000)
+  assert.equal(result.ok, false)
+  assert.equal(result.status, 401)
+  assert.equal(desktop.sent.some(e => e.type === 'AI_TEST_REQUEST'), false)
+})
+
+test('a concurrent WS mobile AI_TEST_REQUEST still broadcasts normally alongside askViaHttp callers', async () => {
+  const { service } = createService()
+  const { claimed, desktop, mobile } = pairDesktopAndMobile(service)
+  desktop.meta = { role: 'desktop', pairId: claimed.payload.pairId }
+  mobile.meta = { role: 'mobile', pairId: claimed.payload.pairId }
+
+  service.handleSocketMessage(mobile, JSON.stringify({
+    type: 'AI_TEST_REQUEST',
+    pairId: claimed.payload.pairId,
+    requestId: 'ws-req-1',
+    payload: { prompt: 'From a WS client' },
+  }))
+  service.handleSocketMessage(desktop, JSON.stringify({
+    type: 'AI_TEST_RESPONSE',
+    pairId: claimed.payload.pairId,
+    requestId: 'ws-req-1',
+    payload: { text: 'Hi WS client' },
+  }))
+  const forwarded = mobile.sent.find(e => e.type === 'AI_TEST_RESPONSE')
+  assert.ok(forwarded, 'the WS mobile client should still get its broadcast response')
+  assert.equal(forwarded.payload.text, 'Hi WS client')
+})
+
+// ── desktopBridgeReady: distinguishing a real bridge from a passive test page ──
+
+test('status reports desktopBridgeReady=false until the desktop sends BRIDGE_READY', () => {
+  const { service } = createService()
+  const { session, claimed, desktop } = pairDesktopAndMobile(service)
+  desktop.meta = { role: 'desktop', pairId: claimed.payload.pairId, pairingSessionId: session.pairingSessionId }
+
+  let status = service.getPairStatus(claimed.payload.pairId, claimed.payload.mobileWsToken)
+  assert.equal(status.payload.desktopOnline, true)
+  assert.equal(status.payload.desktopBridgeReady, false, 'a plain connect.html-style connection never sent BRIDGE_READY')
+
+  service.handleSocketMessage(desktop, JSON.stringify({
+    type: 'BRIDGE_READY',
+    pairId: claimed.payload.pairId,
+    payload: { client: 'wi-desktop-bridge', model: 'qwen3:32b' },
+  }))
+
+  status = service.getPairStatus(claimed.payload.pairId, claimed.payload.mobileWsToken)
+  assert.equal(status.payload.desktopBridgeReady, true)
+  assert.equal(status.payload.desktopBridgeInfo.model, 'qwen3:32b')
+})
